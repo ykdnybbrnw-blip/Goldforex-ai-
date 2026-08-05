@@ -1,5 +1,7 @@
+import hashlib
+import json
 import math
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 import pandas as pd
@@ -949,6 +951,559 @@ def scan_core_markets(
     return sorted(rows, key=lambda row: row["score"], reverse=True)
 
 
+
+# =========================================================
+# PERMANENT AUTOMATIC PAPER-TRADE TRACKING
+# =========================================================
+
+def get_secret(name: str) -> Optional[str]:
+    try:
+        value = st.secrets.get(name)
+        return str(value).strip() if value else None
+    except Exception:
+        return None
+
+
+SUPABASE_URL = get_secret("SUPABASE_URL")
+SUPABASE_KEY = get_secret("SUPABASE_KEY")
+SUPABASE_TABLE = "paper_trades"
+
+
+def supabase_headers(prefer: Optional[str] = None) -> dict:
+    headers = {
+        "apikey": SUPABASE_KEY or "",
+        "Authorization": f"Bearer {SUPABASE_KEY or ''}",
+        "Content-Type": "application/json",
+    }
+    if prefer:
+        headers["Prefer"] = prefer
+    return headers
+
+
+def supabase_ready() -> bool:
+    return bool(SUPABASE_URL and SUPABASE_KEY)
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    payload: Optional[object] = None,
+    prefer: Optional[str] = None,
+):
+    if not supabase_ready():
+        return None, "Supabase secrets are not configured."
+
+    url = f"{SUPABASE_URL.rstrip('/')}/rest/v1/{path.lstrip('/')}"
+
+    try:
+        response = requests.request(
+            method,
+            url,
+            headers=supabase_headers(prefer),
+            params=params,
+            json=payload,
+            timeout=25,
+        )
+        if response.status_code >= 400:
+            return None, f"Supabase error {response.status_code}: {response.text[:300]}"
+
+        if not response.text:
+            return [], None
+
+        return response.json(), None
+    except requests.RequestException as exc:
+        return None, f"Supabase connection error: {exc}"
+    except ValueError:
+        return None, "Supabase returned an invalid response."
+
+
+def make_signal_id(
+    market: str,
+    trade_type: str,
+    direction: str,
+    interval: str,
+    candle_time: datetime,
+    entry: float,
+    stop: float,
+) -> str:
+    raw = "|".join(
+        [
+            market,
+            trade_type,
+            direction,
+            interval,
+            candle_time.astimezone(timezone.utc).isoformat(),
+            f"{entry:.8f}",
+            f"{stop:.8f}",
+        ]
+    )
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+
+
+def save_signal_if_new(
+    candidate: dict,
+    interval: str,
+    candle_time: datetime,
+    risk_amount: float,
+    projection: dict,
+    grade: str,
+) -> tuple[bool, Optional[str]]:
+    """
+    Automatically save only actionable B+ or better signals.
+    WAIT/NO TRADE signals are not counted as trades.
+    """
+    action = candidate["action"]
+    if candidate["score"] < 85:
+        return False, None
+
+    if not ("ENTER" in action or "LIMIT" in action):
+        return False, None
+
+    levels = candidate["levels"]
+    if levels["stop"] is None or levels["tp2"] is None:
+        return False, None
+
+    signal_id = make_signal_id(
+        candidate["market"],
+        candidate["trade_type"],
+        candidate["direction"],
+        interval,
+        candle_time,
+        float(levels["entry"]),
+        float(levels["stop"]),
+    )
+
+    initial_status = "waiting_entry" if "LIMIT" in action else "open"
+
+    record = {
+        "signal_id": signal_id,
+        "signal_time": candle_time.astimezone(timezone.utc).isoformat(),
+        "market": candidate["market"],
+        "symbol": candidate["symbol"],
+        "interval": interval,
+        "trade_type": candidate["trade_type"],
+        "direction": candidate["direction"],
+        "rating": grade,
+        "score": int(candidate["score"]),
+        "action": action,
+        "entry": float(levels["entry"]),
+        "stop": float(levels["stop"]),
+        "tp1": float(levels["tp1"]),
+        "tp2": float(levels["tp2"]),
+        "tp3": float(levels["tp3"]),
+        "planned_risk_gbp": float(risk_amount),
+        "projected_tp1_gbp": (
+            float(projection["tp1"]) if projection["tp1"] is not None else None
+        ),
+        "projected_tp2_gbp": (
+            float(projection["tp2"]) if projection["tp2"] is not None else None
+        ),
+        "projected_tp3_gbp": (
+            float(projection["tp3"]) if projection["tp3"] is not None else None
+        ),
+        "status": initial_status,
+        "entry_time": (
+            candle_time.astimezone(timezone.utc).isoformat()
+            if initial_status == "open"
+            else None
+        ),
+        "highest_target": 0,
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "tp3_hit": False,
+        "stop_hit": False,
+        "simulated_pnl_gbp": None,
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+        "notes": "Automatically recorded paper trade.",
+    }
+
+    data, error = supabase_request(
+        "POST",
+        SUPABASE_TABLE,
+        payload=record,
+        prefer="resolution=ignore-duplicates,return=representation",
+    )
+    if error:
+        return False, error
+
+    return bool(data), None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_tracking_candles(
+    symbol: str,
+    interval: str,
+    start_time_iso: str,
+    api_key: str,
+):
+    url = "https://api.twelvedata.com/time_series"
+
+    start_time = pd.Timestamp(start_time_iso).tz_convert("UTC")
+    start_date = start_time.strftime("%Y-%m-%d %H:%M:%S")
+
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "start_date": start_date,
+        "outputsize": 5000,
+        "apikey": api_key,
+        "format": "JSON",
+        "timezone": "UTC",
+    }
+
+    try:
+        response = requests.get(url, params=params, timeout=25)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        return None, f"Tracking data connection error: {exc}"
+    except ValueError:
+        return None, "Tracking data response was invalid."
+
+    if payload.get("status") == "error":
+        return None, payload.get("message", "Tracking API error.")
+
+    values = payload.get("values")
+    if not values:
+        return None, "No tracking candles were returned."
+
+    frame = pd.DataFrame(values)
+    required = ["datetime", "open", "high", "low", "close"]
+
+    if not all(column in frame.columns for column in required):
+        return None, "Tracking candles were incomplete."
+
+    for column in ["open", "high", "low", "close"]:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
+
+    frame["datetime"] = pd.to_datetime(frame["datetime"], errors="coerce", utc=True)
+
+    frame = (
+        frame.dropna(subset=required)
+        .sort_values("datetime")
+        .reset_index(drop=True)
+    )
+
+    return frame, None
+
+
+def price_touched(candle: pd.Series, price: float) -> bool:
+    return float(candle["low"]) <= price <= float(candle["high"])
+
+
+def calculate_time_exit_pnl(
+    direction: str,
+    entry: float,
+    stop: float,
+    close_price: float,
+    planned_risk: float,
+) -> float:
+    stop_distance = abs(entry - stop)
+    if stop_distance <= 0:
+        return 0.0
+
+    move = (
+        close_price - entry
+        if direction == "BUY"
+        else entry - close_price
+    )
+    r_multiple = move / stop_distance
+    return float(planned_risk * r_multiple)
+
+
+def evaluate_trade_record(trade: dict, candles: pd.DataFrame) -> dict:
+    """
+    Primary evaluation rule:
+    - TP2 is the strategy's main profit exit.
+    - TP1/TP3 are still recorded as milestones.
+    - If stop and TP2 occur in the same candle, mark ambiguous.
+    - Limit entries expire after 3 hours.
+    - Open trades time-exit after 6 hours.
+    """
+    status = trade["status"]
+    if status not in {"waiting_entry", "open"}:
+        return {}
+
+    direction = trade["direction"]
+    entry = float(trade["entry"])
+    stop = float(trade["stop"])
+    tp1 = float(trade["tp1"])
+    tp2 = float(trade["tp2"])
+    tp3 = float(trade["tp3"])
+    planned_risk = float(trade["planned_risk_gbp"])
+
+    signal_time = pd.Timestamp(trade["signal_time"]).tz_convert("UTC")
+    entry_time = (
+        pd.Timestamp(trade["entry_time"]).tz_convert("UTC")
+        if trade.get("entry_time")
+        else None
+    )
+
+    tp1_hit = bool(trade.get("tp1_hit", False))
+    tp2_hit = bool(trade.get("tp2_hit", False))
+    tp3_hit = bool(trade.get("tp3_hit", False))
+    highest_target = int(trade.get("highest_target") or 0)
+
+    updates = {
+        "last_checked_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+    relevant = candles[candles["datetime"] >= signal_time].copy()
+    if relevant.empty:
+        return updates
+
+    for _, candle in relevant.iterrows():
+        candle_time = candle["datetime"].to_pydatetime()
+
+        if status == "waiting_entry":
+            if candle_time > signal_time.to_pydatetime() + timedelta(hours=3):
+                updates.update(
+                    {
+                        "status": "expired_no_entry",
+                        "exit_time": candle_time.isoformat(),
+                        "simulated_pnl_gbp": 0.0,
+                        "notes": "Limit entry did not trigger within 3 hours.",
+                    }
+                )
+                return updates
+
+            if not price_touched(candle, entry):
+                continue
+
+            status = "open"
+            entry_time = pd.Timestamp(candle["datetime"])
+            updates["status"] = "open"
+            updates["entry_time"] = entry_time.isoformat()
+
+        if status != "open" or entry_time is None:
+            continue
+
+        if candle_time < entry_time.to_pydatetime():
+            continue
+
+        if direction == "BUY":
+            stop_touched = float(candle["low"]) <= stop
+            tp1_touched = float(candle["high"]) >= tp1
+            tp2_touched = float(candle["high"]) >= tp2
+            tp3_touched = float(candle["high"]) >= tp3
+        else:
+            stop_touched = float(candle["high"]) >= stop
+            tp1_touched = float(candle["low"]) <= tp1
+            tp2_touched = float(candle["low"]) <= tp2
+            tp3_touched = float(candle["low"]) <= tp3
+
+        # Candle data cannot prove the intrabar order.
+        if stop_touched and tp2_touched:
+            updates.update(
+                {
+                    "status": "ambiguous",
+                    "exit_time": candle_time.isoformat(),
+                    "stop_hit": True,
+                    "tp1_hit": bool(tp1_touched or tp1_hit),
+                    "tp2_hit": True,
+                    "tp3_hit": bool(tp3_touched or tp3_hit),
+                    "highest_target": 3 if tp3_touched else 2,
+                    "simulated_pnl_gbp": None,
+                    "notes": "The same candle touched both stop and TP2; order is unknown.",
+                }
+            )
+            return updates
+
+        if tp1_touched:
+            tp1_hit = True
+            highest_target = max(highest_target, 1)
+
+        if tp2_touched:
+            tp2_hit = True
+            highest_target = max(highest_target, 2)
+            updates.update(
+                {
+                    "status": "closed_tp2",
+                    "exit_time": candle_time.isoformat(),
+                    "tp1_hit": True,
+                    "tp2_hit": True,
+                    "tp3_hit": bool(tp3_touched),
+                    "highest_target": 3 if tp3_touched else 2,
+                    "simulated_pnl_gbp": trade.get("projected_tp2_gbp"),
+                    "notes": "Primary strategy target TP2 was reached before the stop.",
+                }
+            )
+            return updates
+
+        if tp3_touched:
+            tp3_hit = True
+            highest_target = 3
+
+        if stop_touched:
+            updates.update(
+                {
+                    "status": "closed_stop",
+                    "exit_time": candle_time.isoformat(),
+                    "stop_hit": True,
+                    "tp1_hit": tp1_hit,
+                    "tp2_hit": tp2_hit,
+                    "tp3_hit": tp3_hit,
+                    "highest_target": highest_target,
+                    "simulated_pnl_gbp": -planned_risk,
+                    "notes": "Stop loss was reached before TP2.",
+                }
+            )
+            return updates
+
+        if candle_time > entry_time.to_pydatetime() + timedelta(hours=6):
+            pnl = calculate_time_exit_pnl(
+                direction,
+                entry,
+                stop,
+                float(candle["close"]),
+                planned_risk,
+            )
+            updates.update(
+                {
+                    "status": "closed_time_exit",
+                    "exit_time": candle_time.isoformat(),
+                    "tp1_hit": tp1_hit,
+                    "tp2_hit": tp2_hit,
+                    "tp3_hit": tp3_hit,
+                    "highest_target": highest_target,
+                    "simulated_pnl_gbp": pnl,
+                    "notes": "Quick-intraday paper trade closed after 6 hours.",
+                }
+            )
+            return updates
+
+    updates.update(
+        {
+            "status": status,
+            "tp1_hit": tp1_hit,
+            "tp2_hit": tp2_hit,
+            "tp3_hit": tp3_hit,
+            "highest_target": highest_target,
+        }
+    )
+    return updates
+
+
+def load_all_paper_trades() -> tuple[list[dict], Optional[str]]:
+    data, error = supabase_request(
+        "GET",
+        SUPABASE_TABLE,
+        params={
+            "select": "*",
+            "order": "signal_time.desc",
+            "limit": "1000",
+        },
+    )
+    return data or [], error
+
+
+def update_trade(signal_id: str, updates: dict) -> Optional[str]:
+    _, error = supabase_request(
+        "PATCH",
+        SUPABASE_TABLE,
+        params={"signal_id": f"eq.{signal_id}"},
+        payload=updates,
+        prefer="return=minimal",
+    )
+    return error
+
+
+def track_open_trades(api_key: str) -> tuple[int, list[str]]:
+    trades, error = load_all_paper_trades()
+    if error:
+        return 0, [error]
+
+    open_trades = [
+        trade
+        for trade in trades
+        if trade.get("status") in {"waiting_entry", "open"}
+    ]
+
+    updated_count = 0
+    errors: list[str] = []
+
+    for trade in open_trades:
+        candles, candle_error = fetch_tracking_candles(
+            trade["symbol"],
+            trade["interval"],
+            trade["signal_time"],
+            api_key,
+        )
+        if candle_error or candles is None:
+            errors.append(f"{trade['market']}: {candle_error}")
+            continue
+
+        updates = evaluate_trade_record(trade, candles)
+        if not updates:
+            continue
+
+        changed = any(
+            updates.get(key) != trade.get(key)
+            for key in updates
+            if key != "last_checked_at"
+        )
+
+        patch_error = update_trade(trade["signal_id"], updates)
+        if patch_error:
+            errors.append(f"{trade['market']}: {patch_error}")
+        elif changed:
+            updated_count += 1
+
+    return updated_count, errors
+
+
+def performance_tables(trades: list[dict]):
+    if not trades:
+        return None, None, None
+
+    frame = pd.DataFrame(trades)
+    if frame.empty:
+        return None, None, None
+
+    frame["simulated_pnl_gbp"] = pd.to_numeric(
+        frame["simulated_pnl_gbp"],
+        errors="coerce",
+    )
+    completed = frame[
+        frame["status"].isin(
+            ["closed_tp2", "closed_stop", "closed_time_exit"]
+        )
+    ].copy()
+
+    if completed.empty:
+        return frame, pd.DataFrame(), pd.DataFrame()
+
+    completed["Win"] = completed["simulated_pnl_gbp"] > 0
+
+    by_rating = (
+        completed.groupby("rating", dropna=False)
+        .agg(
+            Trades=("signal_id", "count"),
+            Wins=("Win", "sum"),
+            Net_profit=("simulated_pnl_gbp", "sum"),
+            Average_profit=("simulated_pnl_gbp", "mean"),
+        )
+        .reset_index()
+    )
+    by_rating["Win rate"] = (
+        by_rating["Wins"] / by_rating["Trades"] * 100
+    ).round(1)
+
+    by_strategy = (
+        completed.groupby(["trade_type", "market"], dropna=False)
+        .agg(
+            Trades=("signal_id", "count"),
+            Net_profit=("simulated_pnl_gbp", "sum"),
+            Average_profit=("simulated_pnl_gbp", "mean"),
+        )
+        .reset_index()
+    )
+
+    return frame, by_rating, by_strategy
+
+
 with st.sidebar:
     st.header("Trade settings")
 
@@ -1007,6 +1562,13 @@ with st.sidebar:
         value=True,
         help="Scans Gold, US100, US500 and selected major Forex pairs. "
         "Turn this off if your Twelve Data plan reaches its API limit.",
+    )
+
+    automatic_paper_tracking = st.checkbox(
+        "Automatic paper-trade tracking",
+        value=True,
+        help="Automatically records actionable B+ or better signals and "
+        "checks later candles to see whether TP2 or the stop was reached.",
     )
 
     refresh_pressed = st.button(
@@ -1113,6 +1675,47 @@ if profit_filter_failed and (
 ):
     display_action = "NO TRADE — REALISTIC PROFIT BELOW TARGET"
 
+
+# Automatically record new actionable paper trades and update earlier outcomes.
+paper_tracking_messages: list[str] = []
+
+if automatic_paper_tracking:
+    if not supabase_ready():
+        paper_tracking_messages.append(
+            "Automatic history is waiting for Supabase setup."
+        )
+    else:
+        candidate_for_save = dict(best)
+        candidate_for_save["action"] = display_action
+
+        latest_candle_time = (
+            best["_data"].iloc[-1]["datetime"].to_pydatetime()
+            if best.get("_data") is not None
+            else data.iloc[-1]["datetime"].to_pydatetime()
+        )
+
+        saved, save_error = save_signal_if_new(
+            candidate_for_save,
+            interval,
+            latest_candle_time,
+            risk_amount,
+            best_money,
+            best_grade,
+        )
+        if save_error:
+            paper_tracking_messages.append(save_error)
+        elif saved:
+            paper_tracking_messages.append(
+                "New qualifying paper trade recorded automatically."
+            )
+
+        tracked_count, tracking_errors = track_open_trades(API_KEY)
+        if tracked_count:
+            paper_tracking_messages.append(
+                f"Updated {tracked_count} existing paper-trade outcome(s)."
+            )
+        paper_tracking_messages.extend(tracking_errors[:3])
+
 st.markdown("# 🏆 Best trade available")
 st.markdown(
     f"## {best['market']} · {best['trade_type']} TRADE · "
@@ -1165,6 +1768,12 @@ st.caption(
     f"Data symbol: {best['symbol']} · "
     f"Quick-intraday target: roughly 30 minutes to 3 hours"
 )
+
+for message in paper_tracking_messages:
+    if "error" in message.lower():
+        st.warning(message)
+    else:
+        st.caption(f"Paper tracker: {message}")
 
 best_proxy = proxy_warning(best["market"], best["symbol"])
 if best_proxy:
@@ -1451,6 +2060,167 @@ else:
     st.markdown("#### Historical evidence")
     for reason in reversal["reasons"]:
         st.write(f"• {reason}")
+
+
+
+# =========================================================
+# AUTOMATIC PAPER-TRADE PERFORMANCE
+# =========================================================
+
+st.subheader("📚 Automatic strategy history")
+
+if not supabase_ready():
+    st.warning(
+        "Permanent automatic history is not connected yet. "
+        "Add SUPABASE_URL and SUPABASE_KEY to Streamlit Secrets after "
+        "creating the paper_trades table."
+    )
+else:
+    all_trades, history_error = load_all_paper_trades()
+
+    if history_error:
+        st.error(history_error)
+    elif not all_trades:
+        st.info(
+            "No qualifying B+, A or A+ paper trades have been recorded yet."
+        )
+    else:
+        history_frame, rating_table, strategy_table = performance_tables(
+            all_trades
+        )
+
+        total_trades = len(history_frame)
+        completed = history_frame[
+            history_frame["status"].isin(
+                ["closed_tp2", "closed_stop", "closed_time_exit"]
+            )
+        ].copy()
+
+        completed_pnl = pd.to_numeric(
+            completed["simulated_pnl_gbp"],
+            errors="coerce",
+        )
+
+        net_profit = float(completed_pnl.sum()) if not completed.empty else 0.0
+        wins = int((completed_pnl > 0).sum()) if not completed.empty else 0
+        win_rate = (
+            wins / len(completed) * 100
+            if len(completed)
+            else 0.0
+        )
+
+        h1, h2, h3, h4 = st.columns(4)
+        h1.metric("Signals recorded", total_trades)
+        h2.metric("Completed trades", len(completed))
+        h3.metric("Paper net profit", f"£{net_profit:,.2f}")
+        h4.metric("Win rate", f"{win_rate:.1f}%")
+
+        status_counts = (
+            history_frame["status"]
+            .value_counts(dropna=False)
+            .rename_axis("Status")
+            .reset_index(name="Trades")
+        )
+
+        st.markdown("#### Current outcomes")
+        st.dataframe(
+            status_counts,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if rating_table is not None and not rating_table.empty:
+            display_rating = rating_table.copy()
+            display_rating["Net profit"] = display_rating["Net_profit"].map(
+                lambda value: f"£{value:,.2f}"
+            )
+            display_rating["Average profit"] = display_rating[
+                "Average_profit"
+            ].map(lambda value: f"£{value:,.2f}")
+            display_rating = display_rating[
+                [
+                    "rating",
+                    "Trades",
+                    "Wins",
+                    "Win rate",
+                    "Net profit",
+                    "Average profit",
+                ]
+            ].rename(columns={"rating": "Rating"})
+
+            st.markdown("#### Performance by rating")
+            st.dataframe(
+                display_rating,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if strategy_table is not None and not strategy_table.empty:
+            display_strategy = strategy_table.copy()
+            display_strategy["Net profit"] = display_strategy[
+                "Net_profit"
+            ].map(lambda value: f"£{value:,.2f}")
+            display_strategy["Average profit"] = display_strategy[
+                "Average_profit"
+            ].map(lambda value: f"£{value:,.2f}")
+            display_strategy = display_strategy[
+                [
+                    "trade_type",
+                    "market",
+                    "Trades",
+                    "Net profit",
+                    "Average profit",
+                ]
+            ].rename(
+                columns={
+                    "trade_type": "Type",
+                    "market": "Market",
+                }
+            )
+
+            st.markdown("#### Performance by market and strategy")
+            st.dataframe(
+                display_strategy,
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        visible_columns = [
+            "signal_time",
+            "market",
+            "trade_type",
+            "direction",
+            "rating",
+            "score",
+            "action",
+            "entry",
+            "stop",
+            "tp1",
+            "tp2",
+            "tp3",
+            "status",
+            "highest_target",
+            "simulated_pnl_gbp",
+        ]
+        visible_columns = [
+            column
+            for column in visible_columns
+            if column in history_frame.columns
+        ]
+
+        st.markdown("#### Recorded trades")
+        st.dataframe(
+            history_frame[visible_columns],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        st.download_button(
+            "Download full paper-trade history CSV",
+            data=history_frame.to_csv(index=False).encode("utf-8"),
+            file_name="automatic_paper_trade_history.csv",
+            mime="text/csv",
+        )
 
 
 st.divider()
