@@ -1,13 +1,11 @@
-
 import math
-from datetime import datetime
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
+import requests
 import streamlit as st
-import yfinance as yf
 
 
 st.set_page_config(
@@ -16,410 +14,557 @@ st.set_page_config(
     layout="wide",
 )
 
-MARKETS = {
-    "Gold": {
-        "ticker": "GC=F",
-        "contract_size": 100.0,
-        "price_decimals": 2,
-    },
-    "EUR/USD": {
-        "ticker": "EURUSD=X",
-        "contract_size": 100000.0,
-        "price_decimals": 5,
-    },
-    "GBP/USD": {
-        "ticker": "GBPUSD=X",
-        "contract_size": 100000.0,
-        "price_decimals": 5,
-    },
-    "USD/JPY": {
-        "ticker": "JPY=X",
-        "contract_size": 100000.0,
-        "price_decimals": 3,
-    },
-}
-
-TIMEFRAMES = {
-    "15 minutes": ("15m", "60d"),
-    "30 minutes": ("30m", "60d"),
-    "1 hour": ("1h", "2y"),
-}
-
 st.title("GoldForex AI")
-st.caption("Research dashboard only. It does not place trades and cannot guarantee profits.")
+st.caption(
+    "Gold market analysis and risk-planning tool. "
+    "Signals are educational and are not guaranteed."
+)
 
 
-@st.cache_data(ttl=120)
-def download_data(ticker: str, interval: str, period: str) -> pd.DataFrame:
-    data = yf.download(
-        ticker,
-        interval=interval,
-        period=period,
-        auto_adjust=True,
-        progress=False,
+# ---------------------------------------------------------
+# SETTINGS
+# ---------------------------------------------------------
+
+TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
+GOLD_CONTRACT_SIZE = 100.0  # Common XAU/USD specification: 100 oz per 1.00 lot
+
+
+def get_api_key() -> str:
+    """Read the API key securely from Streamlit Secrets."""
+    try:
+        return str(st.secrets["TWELVE_DATA_API_KEY"])
+    except (KeyError, FileNotFoundError):
+        st.error(
+            "Twelve Data API key is missing. Add it to Streamlit Secrets as:\n\n"
+            'TWELVE_DATA_API_KEY = "your-new-key"'
+        )
+        st.stop()
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_market_data(
+    symbol: str,
+    interval: str,
+    outputsize: int,
+    api_key: str,
+) -> pd.DataFrame:
+    """Download OHLC price data from Twelve Data."""
+    params = {
+        "symbol": symbol,
+        "interval": interval,
+        "outputsize": outputsize,
+        "apikey": api_key,
+        "format": "JSON",
+        "timezone": "UTC",
+    }
+
+    try:
+        response = requests.get(
+            TWELVE_DATA_URL,
+            params=params,
+            timeout=20,
+        )
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"Could not connect to Twelve Data: {exc}") from exc
+    except ValueError as exc:
+        raise RuntimeError("Twelve Data returned an invalid response.") from exc
+
+    if payload.get("status") == "error":
+        message = payload.get("message", "Unknown Twelve Data error")
+        raise RuntimeError(message)
+
+    values = payload.get("values")
+
+    if not values:
+        raise RuntimeError(
+            f"No price data was returned for {symbol}. "
+            "Your Twelve Data plan may not support this symbol or interval."
+        )
+
+    frame = pd.DataFrame(values)
+
+    required_columns = {"datetime", "open", "high", "low", "close"}
+
+    if not required_columns.issubset(frame.columns):
+        raise RuntimeError("The returned market data is missing required columns.")
+
+    frame["datetime"] = pd.to_datetime(
+        frame["datetime"],
+        utc=True,
+        errors="coerce",
     )
 
-    if data.empty:
-        raise RuntimeError("No data was returned by Yahoo Finance.")
+    numeric_columns = ["open", "high", "low", "close"]
 
-    if isinstance(data.columns, pd.MultiIndex):
-        data.columns = data.columns.get_level_values(0)
+    if "volume" in frame.columns:
+        numeric_columns.append("volume")
 
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [c for c in required if c not in data.columns]
-    if missing:
-        raise RuntimeError(f"Missing columns: {missing}")
+    for column in numeric_columns:
+        frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-    return data[required].dropna().copy()
+    frame = (
+        frame.dropna(subset=["datetime", "open", "high", "low", "close"])
+        .sort_values("datetime")
+        .drop_duplicates(subset=["datetime"])
+        .reset_index(drop=True)
+    )
+
+    if len(frame) < 60:
+        raise RuntimeError(
+            "Not enough candles were returned to calculate the indicators."
+        )
+
+    return frame
 
 
-@st.cache_data(ttl=120)
-def latest_gbpusd() -> float:
-    data = download_data("GBPUSD=X", "15m", "5d")
-    return float(data["Close"].iloc[-1])
+def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+    """Calculate EMA, RSI, MACD and ATR indicators."""
+    data = frame.copy()
 
+    data["ema20"] = data["close"].ewm(
+        span=20,
+        adjust=False,
+    ).mean()
 
-def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
-    data = data.copy()
+    data["ema50"] = data["close"].ewm(
+        span=50,
+        adjust=False,
+    ).mean()
 
-    data["EMA20"] = data["Close"].ewm(span=20, adjust=False).mean()
-    data["EMA50"] = data["Close"].ewm(span=50, adjust=False).mean()
-    data["EMA200"] = data["Close"].ewm(span=200, adjust=False).mean()
+    price_change = data["close"].diff()
 
-    delta = data["Close"].diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
+    gains = price_change.clip(lower=0)
+    losses = -price_change.clip(upper=0)
 
-    avg_gain = gain.ewm(alpha=1 / 14, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1 / 14, adjust=False).mean()
+    average_gain = gains.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    data["RSI"] = 100 - (100 / (1 + rs))
+    average_loss = losses.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
-    ema12 = data["Close"].ewm(span=12, adjust=False).mean()
-    ema26 = data["Close"].ewm(span=26, adjust=False).mean()
-    data["MACD"] = ema12 - ema26
-    data["MACD_SIGNAL"] = data["MACD"].ewm(span=9, adjust=False).mean()
+    relative_strength = average_gain / average_loss.replace(0, np.nan)
+    data["rsi"] = 100 - (100 / (1 + relative_strength))
+    data["rsi"] = data["rsi"].fillna(50)
 
-    previous_close = data["Close"].shift(1)
+    ema12 = data["close"].ewm(span=12, adjust=False).mean()
+    ema26 = data["close"].ewm(span=26, adjust=False).mean()
+
+    data["macd"] = ema12 - ema26
+    data["macd_signal"] = data["macd"].ewm(
+        span=9,
+        adjust=False,
+    ).mean()
+
+    previous_close = data["close"].shift(1)
+
     true_range = pd.concat(
         [
-            data["High"] - data["Low"],
-            (data["High"] - previous_close).abs(),
-            (data["Low"] - previous_close).abs(),
+            data["high"] - data["low"],
+            (data["high"] - previous_close).abs(),
+            (data["low"] - previous_close).abs(),
         ],
         axis=1,
     ).max(axis=1)
 
-    data["ATR"] = true_range.rolling(14).mean()
-    data["RecentHigh"] = data["High"].rolling(10).max().shift(1)
-    data["RecentLow"] = data["Low"].rolling(10).min().shift(1)
-    data["Support"] = data["Low"].rolling(20).min()
-    data["Resistance"] = data["High"].rolling(20).max()
+    data["atr"] = true_range.ewm(
+        alpha=1 / 14,
+        adjust=False,
+        min_periods=14,
+    ).mean()
 
-    return data.dropna().copy()
+    data["recent_high"] = data["high"].rolling(20).max()
+    data["recent_low"] = data["low"].rolling(20).min()
 
-
-def uk_session() -> tuple[str, bool, datetime]:
-    now = datetime.now(ZoneInfo("Europe/London"))
-    minutes = now.hour * 60 + now.minute
-
-    if 8 * 60 <= minutes <= 11 * 60:
-        return "London focus window", True, now
-
-    if 13 * 60 + 30 <= minutes <= 16 * 60 + 30:
-        return "London/New York overlap", True, now
-
-    return "Outside preferred hours", False, now
+    return data.dropna().reset_index(drop=True)
 
 
-def score_setup(lower: pd.DataFrame, higher: pd.DataFrame) -> dict:
-    row = lower.iloc[-1]
-    hrow = higher.iloc[-1]
+def analyse_setup(data: pd.DataFrame) -> dict:
+    """Score the current setup and create a trade plan."""
+    latest = data.iloc[-1]
+    previous = data.iloc[-2]
 
-    bull = 0
-    bear = 0
+    bullish_points = 0
+    bearish_points = 0
     reasons = []
-    cautions = []
 
-    if hrow["EMA20"] > hrow["EMA50"] > hrow["EMA200"]:
-        bull += 25
-        reasons.append("Higher timeframe trend is bullish")
-    elif hrow["EMA20"] < hrow["EMA50"] < hrow["EMA200"]:
-        bear += 25
-        reasons.append("Higher timeframe trend is bearish")
+    # Trend
+    if latest["close"] > latest["ema20"] > latest["ema50"]:
+        bullish_points += 30
+        reasons.append("Price and EMAs show an upward trend.")
+    elif latest["close"] < latest["ema20"] < latest["ema50"]:
+        bearish_points += 30
+        reasons.append("Price and EMAs show a downward trend.")
     else:
-        cautions.append("Higher timeframe trend is mixed")
+        reasons.append("The EMA trend is mixed.")
 
-    if row["EMA20"] > row["EMA50"] > row["EMA200"]:
-        bull += 20
-        reasons.append("Current timeframe EMAs are bullish")
-    elif row["EMA20"] < row["EMA50"] < row["EMA200"]:
-        bear += 20
-        reasons.append("Current timeframe EMAs are bearish")
+    # Momentum
+    if latest["macd"] > latest["macd_signal"]:
+        bullish_points += 20
+        reasons.append("MACD momentum is bullish.")
     else:
-        cautions.append("Current timeframe EMAs are mixed")
+        bearish_points += 20
+        reasons.append("MACD momentum is bearish.")
 
-    if row["RSI"] >= 55:
-        bull += 15
-        reasons.append("RSI confirms bullish momentum")
-    elif row["RSI"] <= 45:
-        bear += 15
-        reasons.append("RSI confirms bearish momentum")
+    # RSI
+    if 52 <= latest["rsi"] <= 70:
+        bullish_points += 20
+        reasons.append("RSI supports buying momentum.")
+    elif 30 <= latest["rsi"] <= 48:
+        bearish_points += 20
+        reasons.append("RSI supports selling momentum.")
+    elif latest["rsi"] > 70:
+        bearish_points += 5
+        reasons.append("RSI is overbought; buying now may be risky.")
+    elif latest["rsi"] < 30:
+        bullish_points += 5
+        reasons.append("RSI is oversold; selling now may be risky.")
     else:
-        cautions.append("RSI is neutral")
+        reasons.append("RSI is neutral.")
 
-    if row["MACD"] > row["MACD_SIGNAL"]:
-        bull += 15
-        reasons.append("MACD is bullish")
+    # Candle direction
+    if latest["close"] > latest["open"]:
+        bullish_points += 10
+        reasons.append("The latest completed candle is bullish.")
+    elif latest["close"] < latest["open"]:
+        bearish_points += 10
+        reasons.append("The latest completed candle is bearish.")
+
+    # Market structure
+    if (
+        latest["high"] > previous["high"]
+        and latest["low"] > previous["low"]
+    ):
+        bullish_points += 20
+        reasons.append("Price formed a higher high and higher low.")
+    elif (
+        latest["high"] < previous["high"]
+        and latest["low"] < previous["low"]
+    ):
+        bearish_points += 20
+        reasons.append("Price formed a lower high and lower low.")
     else:
-        bear += 15
-        reasons.append("MACD is bearish")
+        reasons.append("Short-term market structure is unclear.")
 
-    if row["Close"] > row["RecentHigh"]:
-        bull += 15
-        reasons.append("Price broke above a recent high")
-    elif row["Close"] < row["RecentLow"]:
-        bear += 15
-        reasons.append("Price broke below a recent low")
-    else:
-        cautions.append("No fresh market-structure break")
+    strongest_score = max(bullish_points, bearish_points)
 
-    if row["Close"] > row["EMA20"]:
-        bull += 10
-    else:
-        bear += 10
-
-    direction = "WAIT"
-    score = max(bull, bear)
-
-    if bull >= 75 and bull > bear:
+    if bullish_points >= 65 and bullish_points >= bearish_points + 20:
         direction = "BUY"
-    elif bear >= 75 and bear > bull:
+        confidence = bullish_points
+    elif bearish_points >= 65 and bearish_points >= bullish_points + 20:
         direction = "SELL"
+        confidence = bearish_points
+    else:
+        direction = "NO TRADE"
+        confidence = strongest_score
+
+    entry = float(latest["close"])
+    atr = float(latest["atr"])
+    stop_distance = max(atr * 1.5, entry * 0.001)
+
+    if direction == "BUY":
+        stop_loss = entry - stop_distance
+        tp1 = entry + stop_distance
+        tp2 = entry + (stop_distance * 2)
+        tp3 = entry + (stop_distance * 3)
+    elif direction == "SELL":
+        stop_loss = entry + stop_distance
+        tp1 = entry - stop_distance
+        tp2 = entry - (stop_distance * 2)
+        tp3 = entry - (stop_distance * 3)
+    else:
+        stop_loss = np.nan
+        tp1 = np.nan
+        tp2 = np.nan
+        tp3 = np.nan
 
     return {
         "direction": direction,
-        "score": int(score),
-        "bull": bull,
-        "bear": bear,
-        "price": float(row["Close"]),
-        "atr": float(row["ATR"]),
-        "rsi": float(row["RSI"]),
-        "support": float(row["Support"]),
-        "resistance": float(row["Resistance"]),
+        "confidence": min(int(confidence), 100),
+        "entry": entry,
+        "stop_loss": stop_loss,
+        "stop_distance": stop_distance,
+        "tp1": tp1,
+        "tp2": tp2,
+        "tp3": tp3,
+        "rsi": float(latest["rsi"]),
+        "atr": atr,
+        "ema20": float(latest["ema20"]),
+        "ema50": float(latest["ema50"]),
         "reasons": reasons,
-        "cautions": cautions,
+        "candle_time": latest["datetime"],
     }
 
 
-def make_trade_plan(
-    result: dict,
-    market_name: str,
+def create_risk_table(
     balance_gbp: float,
-    risk_percent: float,
-    reward_ratio: float,
+    gbp_usd: float,
+    entry: float,
+    stop_distance: float,
     leverage: int,
-) -> dict | None:
-    if result["direction"] == "WAIT":
-        return None
+) -> pd.DataFrame:
+    """Calculate loss, lot size, profit targets and margin."""
+    rows = []
 
-    price = result["price"]
-    atr = result["atr"]
+    for risk_percentage in [1, 2, 3, 5, 10]:
+        risk_gbp = balance_gbp * risk_percentage / 100
+        risk_usd = risk_gbp * gbp_usd
 
-    if result["direction"] == "BUY":
-        stop = price - 1.5 * atr
-        target = price + (price - stop) * reward_ratio
-    else:
-        stop = price + 1.5 * atr
-        target = price - (stop - price) * reward_ratio
+        loss_per_one_lot_usd = stop_distance * GOLD_CONTRACT_SIZE
 
-    risk_gbp = balance_gbp * risk_percent / 100
-    gbpusd = latest_gbpusd()
-    risk_usd = risk_gbp * gbpusd
+        if loss_per_one_lot_usd <= 0:
+            lot_size = 0.0
+        else:
+            lot_size = risk_usd / loss_per_one_lot_usd
 
-    contract_size = MARKETS[market_name]["contract_size"]
-    stop_distance = abs(price - stop)
-    raw_lots = risk_usd / (stop_distance * contract_size)
-    lots = max(0.0, math.floor(raw_lots * 100) / 100)
+        # Round down to 0.01 so displayed risk is not exceeded.
+        lot_size = math.floor(lot_size * 100) / 100
+        lot_size = max(lot_size, 0.0)
 
-    notional_usd = lots * contract_size * price
-    margin_gbp = (notional_usd / max(leverage, 1)) / gbpusd
+        actual_loss_usd = (
+            lot_size * GOLD_CONTRACT_SIZE * stop_distance
+        )
+        actual_loss_gbp = actual_loss_usd / gbp_usd
 
-    return {
-        "entry": price,
-        "stop": stop,
-        "target": target,
-        "risk_gbp": risk_gbp,
-        "reward_gbp": risk_gbp * reward_ratio,
-        "raw_lots": raw_lots,
-        "lots": lots,
-        "margin_gbp": margin_gbp,
-    }
+        margin_usd = (
+            entry * GOLD_CONTRACT_SIZE * lot_size / leverage
+        )
+        margin_gbp = margin_usd / gbp_usd
+
+        rows.append(
+            {
+                "Risk": f"{risk_percentage}%",
+                "Maximum loss": f"£{risk_gbp:,.2f}",
+                "Lot size": f"{lot_size:.2f}",
+                "Estimated actual loss": f"£{actual_loss_gbp:,.2f}",
+                "TP1 profit (1:1)": f"£{actual_loss_gbp:,.2f}",
+                "TP2 profit (1:2)": f"£{actual_loss_gbp * 2:,.2f}",
+                "TP3 profit (1:3)": f"£{actual_loss_gbp * 3:,.2f}",
+                "Estimated margin": f"£{margin_gbp:,.2f}",
+            }
+        )
+
+    return pd.DataFrame(rows)
 
 
-def candlestick_chart(data: pd.DataFrame, market_name: str) -> go.Figure:
-    chart = data.tail(180)
+def make_chart(data: pd.DataFrame) -> go.Figure:
+    chart_data = data.tail(100)
 
-    fig = go.Figure()
+    figure = go.Figure()
 
-    fig.add_trace(
+    figure.add_trace(
         go.Candlestick(
-            x=chart.index,
-            open=chart["Open"],
-            high=chart["High"],
-            low=chart["Low"],
-            close=chart["Close"],
-            name="Price",
+            x=chart_data["datetime"],
+            open=chart_data["open"],
+            high=chart_data["high"],
+            low=chart_data["low"],
+            close=chart_data["close"],
+            name="XAU/USD",
         )
     )
 
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["EMA20"], name="EMA 20"))
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["EMA50"], name="EMA 50"))
-    fig.add_trace(go.Scatter(x=chart.index, y=chart["EMA200"], name="EMA 200"))
+    figure.add_trace(
+        go.Scatter(
+            x=chart_data["datetime"],
+            y=chart_data["ema20"],
+            mode="lines",
+            name="EMA 20",
+        )
+    )
 
-    fig.update_layout(
-        title=f"{market_name} price and trend",
-        height=560,
+    figure.add_trace(
+        go.Scatter(
+            x=chart_data["datetime"],
+            y=chart_data["ema50"],
+            mode="lines",
+            name="EMA 50",
+        )
+    )
+
+    figure.update_layout(
+        title="XAU/USD 15-minute chart",
+        xaxis_title="Time (UTC)",
+        yaxis_title="Gold price in USD",
         xaxis_rangeslider_visible=False,
+        height=550,
         margin=dict(l=10, r=10, t=50, b=10),
     )
 
-    return fig
+    return figure
 
+
+# ---------------------------------------------------------
+# APP
+# ---------------------------------------------------------
+
+api_key = get_api_key()
 
 with st.sidebar:
-    st.header("Settings")
+    st.header("Account settings")
 
-    market_name = st.selectbox("Market", list(MARKETS.keys()), index=0)
-    timeframe_name = st.selectbox("Timeframe", list(TIMEFRAMES.keys()), index=0)
-
-    balance_gbp = st.number_input(
+    account_balance = st.number_input(
         "Account balance (£)",
-        min_value=1.0,
-        value=150.0,
+        min_value=10.0,
+        value=200.0,
         step=10.0,
     )
 
-    risk_percent = st.slider(
-        "Risk per trade (%)",
-        min_value=0.5,
-        max_value=5.0,
-        value=2.0,
-        step=0.5,
+    leverage = st.selectbox(
+        "Broker leverage",
+        options=[30, 50, 100, 200, 500],
+        index=4,
     )
 
-    reward_ratio = st.slider(
-        "Reward-to-risk",
-        min_value=1.0,
-        max_value=4.0,
-        value=2.0,
-        step=0.25,
+    st.caption(
+        "Lot-size calculations assume 1.00 Gold lot equals 100 ounces. "
+        "Confirm this in your broker's XAU/USD contract specification."
     )
 
-    leverage = st.number_input(
-        "Leverage",
-        min_value=1,
-        max_value=1000,
-        value=500,
-        step=1,
+    refresh = st.button(
+        "Refresh analysis",
+        use_container_width=True,
     )
 
-    use_session_filter = st.checkbox(
-        "Use UK daytime filter",
-        value=True,
-    )
+if refresh:
+    st.cache_data.clear()
 
-    analyse = st.button("Analyse market", type="primary", use_container_width=True)
-
-
-if analyse:
-    try:
-        interval, period = TIMEFRAMES[timeframe_name]
-        ticker = MARKETS[market_name]["ticker"]
-
-        with st.spinner("Downloading market data and analysing the setup..."):
-            lower = add_indicators(download_data(ticker, interval, period))
-
-            higher_interval = "1h" if interval in ("15m", "30m") else "1d"
-            higher_period = "2y"
-            higher = add_indicators(
-                download_data(ticker, higher_interval, higher_period)
-            )
-
-            result = score_setup(lower, higher)
-            session_name, session_ok, now = uk_session()
-
-            final_signal = result["direction"]
-            if use_session_filter and not session_ok:
-                final_signal = "WAIT"
-
-            plan = None
-            if final_signal != "WAIT":
-                plan = make_trade_plan(
-                    result,
-                    market_name,
-                    balance_gbp,
-                    risk_percent,
-                    reward_ratio,
-                    int(leverage),
-                )
-
-        signal_col, score_col, price_col, session_col = st.columns(4)
-
-        signal_col.metric("Research signal", final_signal)
-        score_col.metric("Edge score", f"{result['score']}/100")
-        price_col.metric("Yahoo price", f"{result['price']:.{MARKETS[market_name]['price_decimals']}f}")
-        session_col.metric("UK session", session_name)
-
-        if final_signal == "WAIT":
-            st.warning(
-                "No entry plan is shown because the setup does not currently pass every filter."
-            )
-        elif plan is not None:
-            st.subheader("Trade plan")
-
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Entry", f"{plan['entry']:.{MARKETS[market_name]['price_decimals']}f}")
-            c2.metric("Stop", f"{plan['stop']:.{MARKETS[market_name]['price_decimals']}f}")
-            c3.metric("Target", f"{plan['target']:.{MARKETS[market_name]['price_decimals']}f}")
-            c4.metric("Suggested lot size", f"{plan['lots']:.2f}")
-
-            c5, c6, c7 = st.columns(3)
-            c5.metric("Planned risk", f"£{plan['risk_gbp']:.2f}")
-            c6.metric("Potential reward", f"£{plan['reward_gbp']:.2f}")
-            c7.metric("Approx. margin", f"£{plan['margin_gbp']:.2f}")
-
-            if plan["lots"] < 0.01:
-                st.error(
-                    "The calculated size is below 0.01 lots. A 0.01-lot trade may risk more than your selected amount."
-                )
-
-        st.subheader("Why")
-
-        for reason in result["reasons"]:
-            st.write(f"✅ {reason}")
-
-        if use_session_filter and not session_ok:
-            st.write("⚠️ Outside your preferred UK trading hours")
-
-        for caution in result["cautions"]:
-            st.write(f"⚠️ {caution}")
-
-        st.plotly_chart(
-            candlestick_chart(lower, market_name),
-            use_container_width=True,
+try:
+    with st.spinner("Loading live Gold market data..."):
+        gold_data = fetch_market_data(
+            symbol="XAU/USD",
+            interval="15min",
+            outputsize=250,
+            api_key=api_key,
         )
 
-        st.subheader("Important limitations")
-        st.info(
-            "Yahoo Finance gold uses GC=F futures rather than your broker's exact XAU/USD quote. "
-            "The lot-size calculator assumes 100 oz per standard Gold lot and 100,000 units per standard Forex lot. "
-            "Check the contract specification inside 1xTrade before using any lot-size figure live."
+        gbp_usd_data = fetch_market_data(
+            symbol="GBP/USD",
+            interval="15min",
+            outputsize=60,
+            api_key=api_key,
         )
 
-    except Exception as exc:
-        st.error(f"Analysis failed: {exc}")
+        gold_data = add_indicators(gold_data)
+        analysis = analyse_setup(gold_data)
+
+        gbp_usd = float(gbp_usd_data.iloc[-1]["close"])
+
+except RuntimeError as exc:
+    st.error(str(exc))
+    st.stop()
+
+direction = analysis["direction"]
+
+if direction == "BUY":
+    st.success(
+        f"Current result: BUY — setup score {analysis['confidence']}/100"
+    )
+elif direction == "SELL":
+    st.error(
+        f"Current result: SELL — setup score {analysis['confidence']}/100"
+    )
+else:
+    st.warning(
+        f"Current result: NO TRADE — strongest score "
+        f"{analysis['confidence']}/100"
+    )
+
+metric1, metric2, metric3, metric4 = st.columns(4)
+
+metric1.metric(
+    "Gold price",
+    f"${analysis['entry']:,.2f}",
+)
+
+metric2.metric(
+    "RSI",
+    f"{analysis['rsi']:.1f}",
+)
+
+metric3.metric(
+    "ATR",
+    f"${analysis['atr']:.2f}",
+)
+
+metric4.metric(
+    "GBP/USD",
+    f"{gbp_usd:.5f}",
+)
+
+st.plotly_chart(
+    make_chart(gold_data),
+    use_container_width=True,
+)
+
+st.subheader("Setup checklist")
+
+for reason in analysis["reasons"]:
+    st.write(f"• {reason}")
+
+if direction != "NO TRADE":
+    st.subheader("Trade plan")
+
+    plan1, plan2, plan3 = st.columns(3)
+
+    plan1.metric("Entry", f"{analysis['entry']:,.2f}")
+    plan1.metric("Stop loss", f"{analysis['stop_loss']:,.2f}")
+
+    plan2.metric("TP1 — 1:1", f"{analysis['tp1']:,.2f}")
+    plan2.metric("TP2 — 1:2", f"{analysis['tp2']:,.2f}")
+
+    plan3.metric("TP3 — 1:3", f"{analysis['tp3']:,.2f}")
+    plan3.metric(
+        "Stop distance",
+        f"${analysis['stop_distance']:.2f}",
+    )
+
+    st.subheader("Risk and lot-size calculator")
+
+    risk_table = create_risk_table(
+        balance_gbp=account_balance,
+        gbp_usd=gbp_usd,
+        entry=analysis["entry"],
+        stop_distance=analysis["stop_distance"],
+        leverage=leverage,
+    )
+
+    st.dataframe(
+        risk_table,
+        hide_index=True,
+        use_container_width=True,
+    )
+
+    st.warning(
+        "A 10% risk level is extremely aggressive. A short run of losses "
+        "could reduce a small account rapidly. The table shows options, "
+        "not a recommendation to use the largest one."
+    )
 
 else:
-    st.info("Choose your settings, then press **Analyse market**.")
+    st.info(
+        "No stop loss, take profit or lot size is being suggested because "
+        "the setup has not passed the minimum signal score."
+    )
+
+updated_time = datetime.now(timezone.utc)
+
+st.caption(
+    f"Page checked at {updated_time:%d %b %Y, %H:%M:%S} UTC. "
+    "Twelve Data candles may be delayed depending on your subscription."
+)
+
+st.divider()
+
+st.caption(
+    "Important: This tool cannot predict the market or guarantee profit. "
+    "Prices and contract specifications can differ between Twelve Data "
+    "and your broker. Always verify the entry price, contract size, "
+    "minimum lot, spread and stop-loss amount in your broker platform."
+)
