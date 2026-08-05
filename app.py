@@ -35,8 +35,13 @@ MARKETS = {
     "USD/CAD": {"symbols": ["USD/CAD"], "digits": 5, "category": "forex"},
     "EUR/GBP": {"symbols": ["EUR/GBP"], "digits": 5, "category": "forex"},
     "GBP/JPY": {"symbols": ["GBP/JPY"], "digits": 3, "category": "forex"},
-    "S&P 500 ETF — SPY": {
-        "symbols": ["SPY"],
+    "US100 — Nasdaq 100": {
+        "symbols": ["NDX", "QQQ"],
+        "digits": 2,
+        "category": "index",
+    },
+    "US500 — S&P 500": {
+        "symbols": ["SPX", "SPY"],
         "digits": 2,
         "category": "index",
     },
@@ -569,6 +574,141 @@ def estimate_lot_size(
     return max(rounded_lot, 0.01)
 
 
+
+def quality_grade(score: int) -> tuple[str, str]:
+    """Convert a score into the app's visible quality grade."""
+    if score >= 95:
+        return "A+", "⭐⭐⭐⭐⭐"
+    if score >= 90:
+        return "A", "⭐⭐⭐⭐"
+    if score >= 80:
+        return "B", "⭐⭐⭐"
+    if score >= 70:
+        return "C", "⭐⭐"
+    return "REJECT", "❌"
+
+
+def decision_from_analysis(analysis: dict, reversal: dict) -> str:
+    """
+    Step 1 decision layer.
+    This is deliberately strict: it can say WAIT or NO TRADE even when
+    the underlying direction is BUY/SELL.
+    """
+    signal = analysis["signal"]
+    score = int(analysis["confidence"])
+    atr = float(analysis["atr"])
+    price = float(analysis["price"])
+    limit_entry = float(analysis["limit_entry"])
+
+    if signal == "NO TRADE" or score < 80:
+        return "NO TRADE"
+
+    reversal_conflict = (
+        signal == "BUY"
+        and reversal["direction"] == "BEARISH"
+        and reversal["stage"] in {"FORMING", "CONFIRMED"}
+    ) or (
+        signal == "SELL"
+        and reversal["direction"] == "BULLISH"
+        and reversal["stage"] in {"FORMING", "CONFIRMED"}
+    )
+
+    if reversal_conflict:
+        return "WAIT"
+
+    distance_to_limit = abs(price - limit_entry)
+
+    # If the preferred pullback is still meaningfully away, use a limit order.
+    if distance_to_limit > atr * 0.20:
+        return "SET BUY LIMIT" if signal == "BUY" else "SET SELL LIMIT"
+
+    if score >= 90:
+        return "ENTER BUY NOW" if signal == "BUY" else "ENTER SELL NOW"
+
+    return "WAIT"
+
+
+def proxy_warning(selected_name: str, working_symbol: str) -> Optional[str]:
+    if "US100" in selected_name and working_symbol == "QQQ":
+        return "US100 is currently using QQQ as a proxy because direct Nasdaq-100 index data was unavailable."
+    if (
+        ("US500" in selected_name or "E-mini" in selected_name or "Micro E-mini" in selected_name)
+        and working_symbol == "SPY"
+    ):
+        return "This market is currently using SPY as a proxy, not the actual futures/index contract."
+    return None
+
+
+CORE_SCAN_MARKETS = [
+    "Gold — XAU/USD",
+    "US100 — Nasdaq 100",
+    "US500 — S&P 500",
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+]
+
+
+def scan_core_markets(
+    interval: str,
+    output_size: int,
+    api_key: str,
+) -> list[dict]:
+    """
+    Scan a compact list to stay within common Twelve Data API limits.
+    Results are cached by fetch_candles.
+    """
+    rows: list[dict] = []
+
+    for market_name in CORE_SCAN_MARKETS:
+        settings = MARKETS[market_name]
+        candles, symbol, error = fetch_candles(
+            tuple(settings["symbols"]),
+            interval,
+            output_size,
+            api_key,
+        )
+
+        if error or candles is None:
+            rows.append(
+                {
+                    "Market": market_name,
+                    "Rating": "Unavailable",
+                    "Score": 0,
+                    "Action": "NO DATA",
+                    "Direction": "—",
+                    "Symbol used": "—",
+                    "_analysis": None,
+                    "_reversal": None,
+                }
+            )
+            continue
+
+        processed = add_indicators(candles)
+        if len(processed) < 30:
+            continue
+
+        market_analysis = analyse_market(processed)
+        market_reversal = detect_reversal(processed)
+        grade, stars = quality_grade(int(market_analysis["confidence"]))
+        action = decision_from_analysis(market_analysis, market_reversal)
+
+        rows.append(
+            {
+                "Market": market_name,
+                "Rating": f"{stars} {grade}",
+                "Score": int(market_analysis["confidence"]),
+                "Action": action,
+                "Direction": market_analysis["signal"],
+                "Symbol used": symbol,
+                "_analysis": market_analysis,
+                "_reversal": market_reversal,
+            }
+        )
+
+    return sorted(rows, key=lambda row: row["Score"], reverse=True)
+
+
 with st.sidebar:
     st.header("Trade settings")
 
@@ -607,6 +747,13 @@ with st.sidebar:
     st.warning(
         "10% risk per trade is extremely high. "
         "A short losing run can reduce the account quickly."
+    )
+
+    scan_best_trade = st.checkbox(
+        "Scan core markets for best setup",
+        value=True,
+        help="Scans Gold, US100, US500 and selected major Forex pairs. "
+        "Turn this off if your Twelve Data plan reaches its API limit.",
     )
 
     refresh_pressed = st.button(
@@ -656,8 +803,124 @@ def format_price(value):
     return f"{value:,.{digits}f}"
 
 
+
+# =========================================================
+# BEST TRADE AVAILABLE — STEP 1
+# =========================================================
+
+ranking_rows = []
+
+if scan_best_trade:
+    with st.spinner("Comparing the core markets..."):
+        ranking_rows = scan_core_markets(
+            interval=interval,
+            output_size=min(history_size, 200),
+            api_key=API_KEY,
+        )
+
+valid_rankings = [
+    row for row in ranking_rows
+    if row.get("_analysis") is not None
+]
+
+st.markdown("# 🏆 Best trade available")
+
+if valid_rankings:
+    best = valid_rankings[0]
+    best_analysis = best["_analysis"]
+    best_reversal = best["_reversal"]
+    best_grade, best_stars = quality_grade(int(best_analysis["confidence"]))
+    best_action = decision_from_analysis(best_analysis, best_reversal)
+
+    st.markdown(
+        f"## {best['Market']} — {best_stars} {best_grade} "
+        f"({best_analysis['confidence']}/100)"
+    )
+
+    if best_action.startswith("ENTER BUY"):
+        st.success(f"🟢 ACTION: {best_action}")
+    elif best_action.startswith("ENTER SELL"):
+        st.error(f"🔴 ACTION: {best_action}")
+    elif "LIMIT" in best_action:
+        st.warning(f"🟡 ACTION: {best_action}")
+    elif best_action == "WAIT":
+        st.warning("⏳ ACTION: WAIT")
+    else:
+        st.info("❌ ACTION: NO TRADE")
+
+    best_digits = MARKETS[best["Market"]]["digits"]
+
+    def best_price(value):
+        if value is None:
+            return "—"
+        return f"{value:,.{best_digits}f}"
+
+    best_entry = (
+        best_analysis["limit_entry"]
+        if "LIMIT" in best_action
+        else best_analysis["entry"]
+    )
+
+    b1, b2, b3, b4 = st.columns(4)
+    b1.metric("Entry", best_price(best_entry))
+    b2.metric("Stop loss", best_price(best_analysis["stop_loss"]))
+    b3.metric("TP1", best_price(best_analysis["tp1"]))
+    b4.metric("TP2", best_price(best_analysis["tp2"]))
+
+    st.caption(
+        f"Reversal: {best_reversal['title']} · "
+        f"Data symbol: {best['Symbol used']}"
+    )
+
+    best_proxy = proxy_warning(best["Market"], best["Symbol used"])
+    if best_proxy:
+        st.warning(best_proxy)
+
+    if best_grade not in {"A+", "A"}:
+        st.info(
+            "The highest-ranked setup is below A quality. "
+            "Treat the result as WAIT/NO TRADE rather than forcing an entry."
+        )
+
+    display_rows = [
+        {
+            "Rank": index + 1,
+            "Market": row["Market"],
+            "Rating": row["Rating"],
+            "Score": row["Score"],
+            "Action": row["Action"],
+            "Symbol": row["Symbol used"],
+        }
+        for index, row in enumerate(valid_rankings)
+    ]
+
+    st.markdown("### Market rankings")
+    st.dataframe(
+        pd.DataFrame(display_rows),
+        use_container_width=True,
+        hide_index=True,
+    )
+else:
+    selected_grade, selected_stars = quality_grade(int(analysis["confidence"]))
+    selected_action = decision_from_analysis(analysis, reversal)
+
+    st.markdown(
+        f"## {selected_market} — {selected_stars} {selected_grade} "
+        f"({analysis['confidence']}/100)"
+    )
+    st.info(
+        f"ACTION: {selected_action}. "
+        "Core-market scanning is switched off or no ranking data was available."
+    )
+
+st.divider()
+
 st.subheader(f"{selected_market} · {selected_interval_name}")
 st.caption(f"Data symbol currently working: `{working_symbol}`")
+
+selected_proxy_warning = proxy_warning(selected_market, working_symbol)
+if selected_proxy_warning:
+    st.warning(selected_proxy_warning)
 
 top_col1, top_col2, top_col3, top_col4 = st.columns(4)
 
