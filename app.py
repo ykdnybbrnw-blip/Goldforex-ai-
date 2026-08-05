@@ -1,4 +1,5 @@
 import math
+from datetime import datetime, timezone
 from typing import Optional
 
 import pandas as pd
@@ -576,66 +577,320 @@ def estimate_lot_size(
 
 
 def quality_grade(score: int) -> tuple[str, str]:
-    """Convert a score into the app's visible quality grade."""
+    """Convert a quality score into the visible grade."""
     if score >= 95:
         return "A+", "⭐⭐⭐⭐⭐"
     if score >= 90:
         return "A", "⭐⭐⭐⭐"
+    if score >= 85:
+        return "B+", "⭐⭐⭐"
     if score >= 80:
-        return "B", "⭐⭐⭐"
-    if score >= 70:
-        return "C", "⭐⭐"
+        return "B", "⭐⭐"
     return "REJECT", "❌"
 
 
-def decision_from_analysis(analysis: dict, reversal: dict) -> str:
+def interval_minutes(interval: str) -> int:
+    return {
+        "5min": 5,
+        "15min": 15,
+        "1h": 60,
+        "4h": 240,
+    }.get(interval, 60)
+
+
+def readable_duration(minutes: float) -> str:
+    minutes = max(5, int(round(minutes / 5) * 5))
+    if minutes < 60:
+        return f"about {minutes} minutes"
+    hours = minutes / 60
+    if hours < 2:
+        return "about 1–2 hours"
+    if hours < 4:
+        return "about 2–4 hours"
+    if hours < 8:
+        return "about 4–8 hours"
+    return "longer than one trading session"
+
+
+def estimate_target_time(
+    target_distance: Optional[float],
+    atr: float,
+    interval: str,
+) -> str:
+    if not target_distance or atr <= 0:
+        return "—"
+
+    candles_needed = max(target_distance / atr, 0.5)
+    minutes = candles_needed * interval_minutes(interval)
+    return readable_duration(minutes)
+
+
+def adaptive_levels(
+    data: pd.DataFrame,
+    direction: str,
+    entry: float,
+    atr: float,
+) -> dict:
     """
-    Step 1 decision layer.
-    This is deliberately strict: it can say WAIT or NO TRADE even when
-    the underlying direction is BUY/SELL.
+    Intraday levels based on recent structure and current ATR.
+    Targets are deliberately capped to realistic ATR multiples.
     """
-    signal = analysis["signal"]
-    score = int(analysis["confidence"])
-    atr = float(analysis["atr"])
+    recent = data.tail(min(30, len(data)))
+    recent_low = float(recent["low"].min())
+    recent_high = float(recent["high"].max())
+
+    minimum_stop = atr * 0.65
+    maximum_stop = atr * 1.35
+
+    if direction == "BUY":
+        structure_distance = max(entry - recent_low + atr * 0.08, minimum_stop)
+        stop_distance = min(structure_distance, maximum_stop)
+        stop = entry - stop_distance
+
+        raw_targets = [
+            entry + atr * 0.75,
+            entry + atr * 1.15,
+            entry + atr * 1.65,
+        ]
+
+        # A nearby genuine resistance can make TP1 more conservative.
+        if recent_high > entry:
+            raw_targets[0] = min(raw_targets[0], recent_high)
+
+    else:
+        structure_distance = max(recent_high - entry + atr * 0.08, minimum_stop)
+        stop_distance = min(structure_distance, maximum_stop)
+        stop = entry + stop_distance
+
+        raw_targets = [
+            entry - atr * 0.75,
+            entry - atr * 1.15,
+            entry - atr * 1.65,
+        ]
+
+        if recent_low < entry:
+            raw_targets[0] = max(raw_targets[0], recent_low)
+
+    return {
+        "entry": entry,
+        "stop": stop,
+        "stop_distance": abs(entry - stop),
+        "tp1": raw_targets[0],
+        "tp2": raw_targets[1],
+        "tp3": raw_targets[2],
+    }
+
+
+def build_trade_candidate(
+    market_name: str,
+    data: pd.DataFrame,
+    analysis: dict,
+    reversal: dict,
+    interval: str,
+    symbol_used: str,
+) -> dict:
+    """
+    Build both a trend candidate and, when appropriate, a reversal candidate.
+    The higher-quality valid candidate represents the market.
+    """
     price = float(analysis["price"])
-    limit_entry = float(analysis["limit_entry"])
+    atr = float(analysis["atr"])
+    candidates: list[dict] = []
 
-    if signal == "NO TRADE" or score < 80:
-        return "NO TRADE"
+    # ---------------- Trend candidate ----------------
+    if analysis["signal"] in {"BUY", "SELL"}:
+        direction = analysis["signal"]
+        trend_levels = adaptive_levels(data, direction, price, atr)
 
-    reversal_conflict = (
-        signal == "BUY"
-        and reversal["direction"] == "BEARISH"
-        and reversal["stage"] in {"FORMING", "CONFIRMED"}
-    ) or (
-        signal == "SELL"
-        and reversal["direction"] == "BULLISH"
-        and reversal["stage"] in {"FORMING", "CONFIRMED"}
-    )
+        distance_to_ema = abs(price - float(data.iloc[-1]["ema_20"]))
+        reversal_conflict = (
+            direction == "BUY"
+            and reversal["direction"] == "BEARISH"
+            and reversal["stage"] in {"FORMING", "CONFIRMED"}
+        ) or (
+            direction == "SELL"
+            and reversal["direction"] == "BULLISH"
+            and reversal["stage"] in {"FORMING", "CONFIRMED"}
+        )
 
-    if reversal_conflict:
-        return "WAIT"
+        score = int(analysis["confidence"])
+        if reversal_conflict:
+            score -= 10
 
-    distance_to_limit = abs(price - limit_entry)
+        if distance_to_ema <= atr * 0.22 and score >= 90:
+            action = f"ENTER {direction} NOW"
+            entry = price
+        elif distance_to_ema <= atr * 0.75:
+            action = f"SET {direction} LIMIT"
+            entry = float(data.iloc[-1]["ema_20"])
+            trend_levels = adaptive_levels(data, direction, entry, atr)
+        else:
+            action = "WAIT"
+            entry = price
 
-    # If the preferred pullback is still meaningfully away, use a limit order.
-    if distance_to_limit > atr * 0.20:
-        return "SET BUY LIMIT" if signal == "BUY" else "SET SELL LIMIT"
+        candidates.append(
+            {
+                "trade_type": "TREND",
+                "direction": direction,
+                "score": max(0, min(score, 100)),
+                "action": action,
+                "confirmation": (
+                    f"Latest {interval} candle supports the {direction.lower()} trend"
+                    if action.startswith("ENTER")
+                    else f"Wait for price to return near the 20 EMA and hold the {direction.lower()} structure"
+                ),
+                "levels": trend_levels,
+                "reversal_status": reversal["title"],
+                "reasons": analysis["reasons"],
+            }
+        )
 
-    if score >= 90:
-        return "ENTER BUY NOW" if signal == "BUY" else "ENTER SELL NOW"
+    # ---------------- Reversal candidate ----------------
+    if reversal["direction"] in {"BULLISH", "BEARISH"}:
+        direction = "BUY" if reversal["direction"] == "BULLISH" else "SELL"
+        reversal_score = int(reversal["confidence"])
 
-    return "WAIT"
+        if reversal["stage"] == "CONFIRMED":
+            entry = price
+            levels = adaptive_levels(data, direction, entry, atr)
+
+            # Use the reversal invalidation if it is sensible and not extremely wide.
+            invalidation = reversal.get("invalidation")
+            if invalidation is not None:
+                invalidation_distance = abs(entry - float(invalidation))
+                if atr * 0.45 <= invalidation_distance <= atr * 1.50:
+                    levels["stop"] = float(invalidation)
+                    levels["stop_distance"] = invalidation_distance
+
+            distance_from_ema = abs(price - float(data.iloc[-1]["ema_20"]))
+            if distance_from_ema <= atr * 0.45:
+                action = f"ENTER REVERSAL {direction} NOW"
+            else:
+                action = f"SET REVERSAL {direction} LIMIT"
+                entry = float(data.iloc[-1]["ema_20"])
+                levels = adaptive_levels(data, direction, entry, atr)
+
+            reversal_score = min(100, reversal_score + 8)
+
+        elif reversal["stage"] == "FORMING":
+            entry = price
+            levels = adaptive_levels(data, direction, entry, atr)
+            action = "WAIT FOR REVERSAL CONFIRMATION"
+        else:
+            entry = price
+            levels = adaptive_levels(data, direction, entry, atr)
+            action = "NO REVERSAL TRADE"
+
+        candidates.append(
+            {
+                "trade_type": "REVERSAL",
+                "direction": direction,
+                "score": max(0, min(reversal_score, 100)),
+                "action": action,
+                "confirmation": (
+                    f"Candle close beyond {reversal['confirmation']:.5f}"
+                    if reversal.get("confirmation") is not None
+                    else "No confirmation level available"
+                ),
+                "levels": levels,
+                "reversal_status": reversal["title"],
+                "reasons": reversal["reasons"],
+            }
+        )
+
+    if not candidates:
+        return {
+            "market": market_name,
+            "symbol": symbol_used,
+            "trade_type": "NONE",
+            "direction": "—",
+            "score": int(analysis["confidence"]),
+            "action": "NO TRADE",
+            "confirmation": "Indicators are conflicting",
+            "levels": {
+                "entry": price,
+                "stop": None,
+                "stop_distance": None,
+                "tp1": None,
+                "tp2": None,
+                "tp3": None,
+            },
+            "reversal_status": reversal["title"],
+            "reasons": analysis["reasons"],
+        }
+
+    best = sorted(candidates, key=lambda item: item["score"], reverse=True)[0]
+    best["market"] = market_name
+    best["symbol"] = symbol_used
+
+    # Strict B+ minimum. A forming reversal never becomes an entry.
+    if best["score"] < 85:
+        best["action"] = "NO TRADE — BELOW B+"
+    elif best["trade_type"] == "REVERSAL" and reversal["stage"] != "CONFIRMED":
+        best["action"] = "WAIT FOR REVERSAL CONFIRMATION"
+
+    return best
+
+
+def money_projection(
+    candidate: dict,
+    risk_amount: float,
+) -> dict:
+    levels = candidate["levels"]
+    stop_distance = levels.get("stop_distance")
+
+    if not stop_distance or stop_distance <= 0:
+        return {
+            "risk": risk_amount,
+            "tp1": None,
+            "tp2": None,
+            "tp3": None,
+            "rr1": None,
+            "rr2": None,
+            "rr3": None,
+        }
+
+    entry = levels["entry"]
+    direction = candidate["direction"]
+
+    def distance(target):
+        if target is None:
+            return None
+        return (
+            target - entry
+            if direction == "BUY"
+            else entry - target
+        )
+
+    projections = {}
+    for name in ["tp1", "tp2", "tp3"]:
+        target_distance = distance(levels[name])
+        if target_distance is None or target_distance <= 0:
+            projections[name] = None
+            projections[f"rr{name[-1]}"] = None
+        else:
+            rr = target_distance / stop_distance
+            projections[name] = risk_amount * rr
+            projections[f"rr{name[-1]}"] = rr
+
+    projections["risk"] = risk_amount
+    return projections
 
 
 def proxy_warning(selected_name: str, working_symbol: str) -> Optional[str]:
     if "US100" in selected_name and working_symbol == "QQQ":
-        return "US100 is currently using QQQ as a proxy because direct Nasdaq-100 index data was unavailable."
+        return (
+            "US100 is currently using QQQ as a proxy because direct "
+            "Nasdaq-100 index data was unavailable."
+        )
     if (
         ("US500" in selected_name or "E-mini" in selected_name or "Micro E-mini" in selected_name)
         and working_symbol == "SPY"
     ):
-        return "This market is currently using SPY as a proxy, not the actual futures/index contract."
+        return (
+            "This market is currently using SPY as a proxy, not the "
+            "actual futures/index contract."
+        )
     return None
 
 
@@ -654,10 +909,6 @@ def scan_core_markets(
     output_size: int,
     api_key: str,
 ) -> list[dict]:
-    """
-    Scan a compact list to stay within common Twelve Data API limits.
-    Results are cached by fetch_candles.
-    """
     rows: list[dict] = []
 
     for market_name in CORE_SCAN_MARKETS:
@@ -670,18 +921,6 @@ def scan_core_markets(
         )
 
         if error or candles is None:
-            rows.append(
-                {
-                    "Market": market_name,
-                    "Rating": "Unavailable",
-                    "Score": 0,
-                    "Action": "NO DATA",
-                    "Direction": "—",
-                    "Symbol used": "—",
-                    "_analysis": None,
-                    "_reversal": None,
-                }
-            )
             continue
 
         processed = add_indicators(candles)
@@ -690,23 +929,24 @@ def scan_core_markets(
 
         market_analysis = analyse_market(processed)
         market_reversal = detect_reversal(processed)
-        grade, stars = quality_grade(int(market_analysis["confidence"]))
-        action = decision_from_analysis(market_analysis, market_reversal)
-
+        candidate = build_trade_candidate(
+            market_name,
+            processed,
+            market_analysis,
+            market_reversal,
+            interval,
+            symbol,
+        )
         rows.append(
             {
-                "Market": market_name,
-                "Rating": f"{stars} {grade}",
-                "Score": int(market_analysis["confidence"]),
-                "Action": action,
-                "Direction": market_analysis["signal"],
-                "Symbol used": symbol,
+                **candidate,
                 "_analysis": market_analysis,
                 "_reversal": market_reversal,
+                "_data": processed,
             }
         )
 
-    return sorted(rows, key=lambda row: row["Score"], reverse=True)
+    return sorted(rows, key=lambda row: row["score"], reverse=True)
 
 
 with st.sidebar:
@@ -723,6 +963,11 @@ with st.sidebar:
         index=2,
     )
 
+    trading_style = st.selectbox(
+        "Trading style",
+        ["Quick intraday (30 min–3 hours)"],
+    )
+
     account_balance = st.number_input(
         "Account balance (£)",
         min_value=1.0,
@@ -733,9 +978,17 @@ with st.sidebar:
     risk_percentage = st.slider(
         "Risk per trade (%)",
         min_value=0.5,
-        max_value=10.0,
+        max_value=5.0,
         value=2.0,
         step=0.5,
+    )
+
+    minimum_profit = st.number_input(
+        "Minimum realistic profit potential (£)",
+        min_value=0.0,
+        value=25.0,
+        step=5.0,
+        help="The app will not stretch targets to meet this number.",
     )
 
     history_size = st.select_slider(
@@ -805,112 +1058,169 @@ def format_price(value):
 
 
 # =========================================================
-# BEST TRADE AVAILABLE — STEP 1
+# BEST TRADE AVAILABLE — VERSION 2
 # =========================================================
 
+risk_amount = account_balance * (risk_percentage / 100)
 ranking_rows = []
 
 if scan_best_trade:
-    with st.spinner("Comparing the core markets..."):
+    with st.spinner("Comparing Gold, US100, US500 and major Forex pairs..."):
         ranking_rows = scan_core_markets(
             interval=interval,
             output_size=min(history_size, 200),
             api_key=API_KEY,
         )
 
-valid_rankings = [
-    row for row in ranking_rows
-    if row.get("_analysis") is not None
-]
+if ranking_rows:
+    best = ranking_rows[0]
+else:
+    best = build_trade_candidate(
+        selected_market,
+        data,
+        analysis,
+        reversal,
+        interval,
+        working_symbol,
+    )
+
+best_money = money_projection(best, risk_amount)
+best_grade, best_stars = quality_grade(int(best["score"]))
+best_digits = MARKETs_digits = MARKETS[best["market"]]["digits"]
+
+
+def best_price(value):
+    if value is None:
+        return "—"
+    return f"{value:,.{best_digits}f}"
+
+
+def money_text(value):
+    if value is None:
+        return "—"
+    return f"£{value:,.2f}"
+
+
+# Do not approve a trade whose realistic TP2 does not meet the chosen target.
+profit_filter_failed = (
+    best_money["tp2"] is not None
+    and best_money["tp2"] < minimum_profit
+)
+
+display_action = best["action"]
+if profit_filter_failed and (
+    "ENTER" in display_action or "LIMIT" in display_action
+):
+    display_action = "NO TRADE — REALISTIC PROFIT BELOW TARGET"
 
 st.markdown("# 🏆 Best trade available")
+st.markdown(
+    f"## {best['market']} · {best['trade_type']} TRADE · "
+    f"{best_stars} {best_grade} ({best['score']}/100)"
+)
 
-if valid_rankings:
-    best = valid_rankings[0]
-    best_analysis = best["_analysis"]
-    best_reversal = best["_reversal"]
-    best_grade, best_stars = quality_grade(int(best_analysis["confidence"]))
-    best_action = decision_from_analysis(best_analysis, best_reversal)
+if display_action.startswith("ENTER") and "SELL" not in display_action:
+    st.success(f"🟢 ACTION: {display_action}")
+elif display_action.startswith("ENTER") and "SELL" in display_action:
+    st.error(f"🔴 ACTION: {display_action}")
+elif "LIMIT" in display_action:
+    st.warning(f"🟡 ACTION: {display_action}")
+elif "WAIT" in display_action:
+    st.warning(f"⏳ ACTION: {display_action}")
+else:
+    st.info(f"❌ ACTION: {display_action}")
 
-    st.markdown(
-        f"## {best['Market']} — {best_stars} {best_grade} "
-        f"({best_analysis['confidence']}/100)"
+top1, top2, top3, top4 = st.columns(4)
+top1.metric("Trade timeframe", selected_interval_name)
+top2.metric(
+    "Expected holding time",
+    estimate_target_time(
+        abs(best["levels"]["tp2"] - best["levels"]["entry"])
+        if best["levels"]["tp2"] is not None
+        else None,
+        float(best["_analysis"]["atr"]) if "_analysis" in best else float(analysis["atr"]),
+        interval,
+    ),
+)
+top3.metric("Maximum planned loss", money_text(best_money["risk"]))
+top4.metric("Realistic TP2 profit", money_text(best_money["tp2"]))
+
+st.markdown("### Entry and exit plan")
+p1, p2, p3, p4 = st.columns(4)
+p1.metric("Entry", best_price(best["levels"]["entry"]))
+p2.metric("Stop loss", best_price(best["levels"]["stop"]))
+p3.metric("TP1", best_price(best["levels"]["tp1"]))
+p4.metric("TP2", best_price(best["levels"]["tp2"]))
+
+p5, p6, p7, p8 = st.columns(4)
+p5.metric("TP3", best_price(best["levels"]["tp3"]))
+p6.metric("Profit at TP1", money_text(best_money["tp1"]))
+p7.metric("Profit at TP2", money_text(best_money["tp2"]))
+p8.metric("Profit at TP3", money_text(best_money["tp3"]))
+
+st.markdown("### Entry confirmation")
+st.write(best["confirmation"])
+st.caption(
+    f"Reversal status: {best['reversal_status']} · "
+    f"Data symbol: {best['symbol']} · "
+    f"Quick-intraday target: roughly 30 minutes to 3 hours"
+)
+
+best_proxy = proxy_warning(best["market"], best["symbol"])
+if best_proxy:
+    st.warning(best_proxy)
+
+if best["score"] < 85:
+    st.warning(
+        "This setup is below your B+ minimum. Protect your capital and wait."
     )
 
-    if best_action.startswith("ENTER BUY"):
-        st.success(f"🟢 ACTION: {best_action}")
-    elif best_action.startswith("ENTER SELL"):
-        st.error(f"🔴 ACTION: {best_action}")
-    elif "LIMIT" in best_action:
-        st.warning(f"🟡 ACTION: {best_action}")
-    elif best_action == "WAIT":
-        st.warning("⏳ ACTION: WAIT")
-    else:
-        st.info("❌ ACTION: NO TRADE")
-
-    best_digits = MARKETS[best["Market"]]["digits"]
-
-    def best_price(value):
-        if value is None:
-            return "—"
-        return f"{value:,.{best_digits}f}"
-
-    best_entry = (
-        best_analysis["limit_entry"]
-        if "LIMIT" in best_action
-        else best_analysis["entry"]
+if profit_filter_failed:
+    st.warning(
+        f"The market-based TP2 projects only {money_text(best_money['tp2'])}, "
+        f"below your £{minimum_profit:,.2f} minimum. "
+        "The app has not moved the target further away to force a trade."
     )
 
-    b1, b2, b3, b4 = st.columns(4)
-    b1.metric("Entry", best_price(best_entry))
-    b2.metric("Stop loss", best_price(best_analysis["stop_loss"]))
-    b3.metric("TP1", best_price(best_analysis["tp1"]))
-    b4.metric("TP2", best_price(best_analysis["tp2"]))
+st.markdown("### Why this trade?")
+for reason in best["reasons"][:6]:
+    st.write(f"• {reason}")
 
-    st.caption(
-        f"Reversal: {best_reversal['title']} · "
-        f"Data symbol: {best['Symbol used']}"
-    )
+if ranking_rows:
+    st.markdown("### Market rankings")
+    display_rows = []
+    for index, row in enumerate(ranking_rows):
+        grade, stars = quality_grade(int(row["score"]))
+        projection = money_projection(row, risk_amount)
+        row_action = row["action"]
+        if (
+            projection["tp2"] is not None
+            and projection["tp2"] < minimum_profit
+            and ("ENTER" in row_action or "LIMIT" in row_action)
+        ):
+            row_action = "NO TRADE — PROFIT FILTER"
 
-    best_proxy = proxy_warning(best["Market"], best["Symbol used"])
-    if best_proxy:
-        st.warning(best_proxy)
-
-    if best_grade not in {"A+", "A"}:
-        st.info(
-            "The highest-ranked setup is below A quality. "
-            "Treat the result as WAIT/NO TRADE rather than forcing an entry."
+        display_rows.append(
+            {
+                "Rank": index + 1,
+                "Market": row["market"],
+                "Type": row["trade_type"],
+                "Rating": f"{stars} {grade}",
+                "Score": row["score"],
+                "Action": row_action,
+                "TP2 £": (
+                    "—"
+                    if projection["tp2"] is None
+                    else f"£{projection['tp2']:.2f}"
+                ),
+                "Symbol": row["symbol"],
+            }
         )
 
-    display_rows = [
-        {
-            "Rank": index + 1,
-            "Market": row["Market"],
-            "Rating": row["Rating"],
-            "Score": row["Score"],
-            "Action": row["Action"],
-            "Symbol": row["Symbol used"],
-        }
-        for index, row in enumerate(valid_rankings)
-    ]
-
-    st.markdown("### Market rankings")
     st.dataframe(
         pd.DataFrame(display_rows),
         use_container_width=True,
         hide_index=True,
-    )
-else:
-    selected_grade, selected_stars = quality_grade(int(analysis["confidence"]))
-    selected_action = decision_from_analysis(analysis, reversal)
-
-    st.markdown(
-        f"## {selected_market} — {selected_stars} {selected_grade} "
-        f"({analysis['confidence']}/100)"
-    )
-    st.info(
-        f"ACTION: {selected_action}. "
-        "Core-market scanning is switched off or no ranking data was available."
     )
 
 st.divider()
