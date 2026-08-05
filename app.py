@@ -1,570 +1,1074 @@
 import math
-from datetime import datetime, timezone
+from typing import Optional
 
-import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
 import streamlit as st
 
 
+# =========================================================
+# PAGE SETUP
+# =========================================================
+
 st.set_page_config(
-    page_title="GoldForex AI",
+    page_title="Gold & Forex AI",
     page_icon="📈",
     layout="wide",
 )
 
-st.title("GoldForex AI")
+st.title("📈 Gold & Forex Trading Assistant")
 st.caption(
-    "Gold market analysis and risk-planning tool. "
-    "Signals are educational and are not guaranteed."
+    "Live market analysis using Twelve Data. "
+    "Signals are estimates from technical indicators, not guaranteed predictions."
 )
 
 
-# ---------------------------------------------------------
-# SETTINGS
-# ---------------------------------------------------------
+# =========================================================
+# MARKET SETTINGS
+# =========================================================
 
-TWELVE_DATA_URL = "https://api.twelvedata.com/time_series"
-GOLD_CONTRACT_SIZE = 100.0  # Common XAU/USD specification: 100 oz per 1.00 lot
+MARKETS = {
+    "Gold — XAU/USD": {
+        "symbols": ["XAU/USD", "XAUUSD"],
+        "digits": 2,
+        "category": "gold",
+    },
+    "EUR/USD": {
+        "symbols": ["EUR/USD"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "GBP/USD": {
+        "symbols": ["GBP/USD"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "USD/JPY": {
+        "symbols": ["USD/JPY"],
+        "digits": 3,
+        "category": "forex",
+    },
+    "USD/CHF": {
+        "symbols": ["USD/CHF"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "AUD/USD": {
+        "symbols": ["AUD/USD"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "NZD/USD": {
+        "symbols": ["NZD/USD"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "USD/CAD": {
+        "symbols": ["USD/CAD"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "EUR/GBP": {
+        "symbols": ["EUR/GBP"],
+        "digits": 5,
+        "category": "forex",
+    },
+    "GBP/JPY": {
+        "symbols": ["GBP/JPY"],
+        "digits": 3,
+        "category": "forex",
+    },
+    "S&P 500 Index": {
+        "symbols": ["SPX", "GSPC", "SPY"],
+        "digits": 2,
+        "category": "index",
+    },
+    "E-mini S&P 500": {
+        "symbols": ["ES", "ES1!", "SPY"],
+        "digits": 2,
+        "category": "index",
+    },
+    "Micro E-mini S&P 500": {
+        "symbols": ["MES", "MES1!", "SPY"],
+        "digits": 2,
+        "category": "index",
+    },
+}
+
+INTERVALS = {
+    "5 minutes": "5min",
+    "15 minutes": "15min",
+    "1 hour": "1h",
+    "4 hours": "4h",
+}
 
 
-def get_api_key() -> str:
-    """Read the API key securely from Streamlit Secrets."""
-    try:
-        return str(st.secrets["TWELVE_DATA_API_KEY"])
-    except (KeyError, FileNotFoundError):
-        st.error(
-            "Twelve Data API key is missing. Add it to Streamlit Secrets as:\n\n"
-            'TWELVE_DATA_API_KEY = "your-new-key"'
-        )
-        st.stop()
+# =========================================================
+# API KEY
+# =========================================================
 
+def get_api_key() -> Optional[str]:
+    possible_names = [
+        "TWELVE_DATA_API_KEY",
+        "TWELVEDATA_API_KEY",
+        "twelve_data_api_key",
+        "API_KEY",
+        "api_key",
+    ]
+
+    for name in possible_names:
+        try:
+            value = st.secrets.get(name)
+            if value:
+                return str(value).strip()
+        except Exception:
+            pass
+
+    return None
+
+
+API_KEY = get_api_key()
+
+if not API_KEY:
+    st.error(
+        "Twelve Data API key not found. In Streamlit Secrets, add:\n\n"
+        'TWELVE_DATA_API_KEY = "your_key_here"'
+    )
+    st.stop()
+
+
+# =========================================================
+# DATA FUNCTIONS
+# =========================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_market_data(
-    symbol: str,
+def fetch_candles(
+    candidate_symbols: tuple,
     interval: str,
-    outputsize: int,
+    output_size: int,
     api_key: str,
-) -> pd.DataFrame:
-    """Download OHLC price data from Twelve Data."""
-    params = {
-        "symbol": symbol,
-        "interval": interval,
-        "outputsize": outputsize,
-        "apikey": api_key,
-        "format": "JSON",
-        "timezone": "UTC",
-    }
+):
+    url = "https://api.twelvedata.com/time_series"
+    last_error = "No market data returned."
 
-    try:
-        response = requests.get(
-            TWELVE_DATA_URL,
-            params=params,
-            timeout=20,
-        )
-        response.raise_for_status()
-        payload = response.json()
-    except requests.RequestException as exc:
-        raise RuntimeError(f"Could not connect to Twelve Data: {exc}") from exc
-    except ValueError as exc:
-        raise RuntimeError("Twelve Data returned an invalid response.") from exc
+    for symbol in candidate_symbols:
+        params = {
+            "symbol": symbol,
+            "interval": interval,
+            "outputsize": output_size,
+            "apikey": api_key,
+            "format": "JSON",
+            "timezone": "UTC",
+        }
 
-    if payload.get("status") == "error":
-        message = payload.get("message", "Unknown Twelve Data error")
-        raise RuntimeError(message)
+        try:
+            response = requests.get(url, params=params, timeout=20)
+            response.raise_for_status()
+            payload = response.json()
+        except requests.RequestException as exc:
+            last_error = f"Connection error: {exc}"
+            continue
+        except ValueError:
+            last_error = "Twelve Data returned an invalid response."
+            continue
 
-    values = payload.get("values")
+        if payload.get("status") == "error":
+            last_error = payload.get("message", "Twelve Data API error.")
+            continue
 
-    if not values:
-        raise RuntimeError(
-            f"No price data was returned for {symbol}. "
-            "Your Twelve Data plan may not support this symbol or interval."
-        )
+        values = payload.get("values")
 
-    frame = pd.DataFrame(values)
+        if not values:
+            last_error = f"No candles were returned for {symbol}."
+            continue
 
-    required_columns = {"datetime", "open", "high", "low", "close"}
+        frame = pd.DataFrame(values)
 
-    if not required_columns.issubset(frame.columns):
-        raise RuntimeError("The returned market data is missing required columns.")
+        required_columns = ["datetime", "open", "high", "low", "close"]
 
-    frame["datetime"] = pd.to_datetime(
-        frame["datetime"],
-        utc=True,
-        errors="coerce",
-    )
+        if not all(column in frame.columns for column in required_columns):
+            last_error = f"Incomplete candle data returned for {symbol}."
+            continue
 
-    numeric_columns = ["open", "high", "low", "close"]
+        for column in ["open", "high", "low", "close"]:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
 
-    if "volume" in frame.columns:
-        numeric_columns.append("volume")
+        if "volume" in frame.columns:
+            frame["volume"] = pd.to_numeric(
+                frame["volume"],
+                errors="coerce",
+            )
 
-    for column in numeric_columns:
-        frame[column] = pd.to_numeric(frame[column], errors="coerce")
-
-    frame = (
-        frame.dropna(subset=["datetime", "open", "high", "low", "close"])
-        .sort_values("datetime")
-        .drop_duplicates(subset=["datetime"])
-        .reset_index(drop=True)
-    )
-
-    if len(frame) < 60:
-        raise RuntimeError(
-            "Not enough candles were returned to calculate the indicators."
+        frame["datetime"] = pd.to_datetime(
+            frame["datetime"],
+            errors="coerce",
+            utc=True,
         )
 
-    return frame
+        frame = (
+            frame.dropna(subset=required_columns)
+            .sort_values("datetime")
+            .reset_index(drop=True)
+        )
+
+        if len(frame) < 55:
+            last_error = (
+                f"Not enough candle history was returned for {symbol}. "
+                "Try again later or choose another interval."
+            )
+            continue
+
+        return frame, symbol, None
+
+    return None, None, last_error
 
 
-def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
-    """Calculate EMA, RSI, MACD and ATR indicators."""
-    data = frame.copy()
+# =========================================================
+# INDICATORS
+# =========================================================
 
-    data["ema20"] = data["close"].ewm(
-        span=20,
-        adjust=False,
-    ).mean()
+def calculate_rsi(close: pd.Series, period: int = 14) -> pd.Series:
+    change = close.diff()
 
-    data["ema50"] = data["close"].ewm(
-        span=50,
-        adjust=False,
-    ).mean()
-
-    price_change = data["close"].diff()
-
-    gains = price_change.clip(lower=0)
-    losses = -price_change.clip(upper=0)
+    gains = change.clip(lower=0)
+    losses = -change.clip(upper=0)
 
     average_gain = gains.ewm(
-        alpha=1 / 14,
+        alpha=1 / period,
         adjust=False,
-        min_periods=14,
+        min_periods=period,
     ).mean()
 
     average_loss = losses.ewm(
-        alpha=1 / 14,
+        alpha=1 / period,
         adjust=False,
-        min_periods=14,
+        min_periods=period,
     ).mean()
 
-    relative_strength = average_gain / average_loss.replace(0, np.nan)
-    data["rsi"] = 100 - (100 / (1 + relative_strength))
-    data["rsi"] = data["rsi"].fillna(50)
+    relative_strength = average_gain / average_loss.replace(0, float("nan"))
 
-    ema12 = data["close"].ewm(span=12, adjust=False).mean()
-    ema26 = data["close"].ewm(span=26, adjust=False).mean()
+    rsi = 100 - (100 / (1 + relative_strength))
 
-    data["macd"] = ema12 - ema26
+    return rsi.fillna(50)
+
+
+def calculate_atr(frame: pd.DataFrame, period: int = 14) -> pd.Series:
+    previous_close = frame["close"].shift(1)
+
+    ranges = pd.concat(
+        [
+            frame["high"] - frame["low"],
+            (frame["high"] - previous_close).abs(),
+            (frame["low"] - previous_close).abs(),
+        ],
+        axis=1,
+    )
+
+    true_range = ranges.max(axis=1)
+
+    return true_range.ewm(
+        alpha=1 / period,
+        adjust=False,
+        min_periods=period,
+    ).mean()
+
+
+def add_indicators(frame: pd.DataFrame) -> pd.DataFrame:
+    data = frame.copy()
+
+    data["ema_9"] = data["close"].ewm(span=9, adjust=False).mean()
+    data["ema_20"] = data["close"].ewm(span=20, adjust=False).mean()
+    data["ema_50"] = data["close"].ewm(span=50, adjust=False).mean()
+    data["ema_200"] = data["close"].ewm(span=200, adjust=False).mean()
+
+    data["rsi"] = calculate_rsi(data["close"], 14)
+
+    data["macd"] = (
+        data["close"].ewm(span=12, adjust=False).mean()
+        - data["close"].ewm(span=26, adjust=False).mean()
+    )
+
     data["macd_signal"] = data["macd"].ewm(
         span=9,
         adjust=False,
     ).mean()
 
-    previous_close = data["close"].shift(1)
+    data["macd_histogram"] = (
+        data["macd"] - data["macd_signal"]
+    )
 
-    true_range = pd.concat(
-        [
-            data["high"] - data["low"],
-            (data["high"] - previous_close).abs(),
-            (data["low"] - previous_close).abs(),
-        ],
-        axis=1,
-    ).max(axis=1)
-
-    data["atr"] = true_range.ewm(
-        alpha=1 / 14,
-        adjust=False,
-        min_periods=14,
-    ).mean()
-
-    data["recent_high"] = data["high"].rolling(20).max()
-    data["recent_low"] = data["low"].rolling(20).min()
+    data["atr"] = calculate_atr(data, 14)
 
     return data.dropna().reset_index(drop=True)
 
 
-def analyse_setup(data: pd.DataFrame) -> dict:
-    """Score the current setup and create a trade plan."""
+# =========================================================
+# SUPPORT AND RESISTANCE
+# =========================================================
+
+def calculate_support_resistance(
+    data: pd.DataFrame,
+    lookback: int = 50,
+):
+    recent = data.tail(min(lookback, len(data)))
+
+    support = float(recent["low"].min())
+    resistance = float(recent["high"].max())
+
+    return support, resistance
+
+
+# =========================================================
+# MAIN SIGNAL
+# =========================================================
+
+def analyse_market(data: pd.DataFrame):
     latest = data.iloc[-1]
     previous = data.iloc[-2]
 
     bullish_points = 0
     bearish_points = 0
-    reasons = []
+    bullish_reasons = []
+    bearish_reasons = []
 
-    # Trend
-    if latest["close"] > latest["ema20"] > latest["ema50"]:
-        bullish_points += 30
-        reasons.append("Price and EMAs show an upward trend.")
-    elif latest["close"] < latest["ema20"] < latest["ema50"]:
-        bearish_points += 30
-        reasons.append("Price and EMAs show a downward trend.")
-    else:
-        reasons.append("The EMA trend is mixed.")
-
-    # Momentum
-    if latest["macd"] > latest["macd_signal"]:
-        bullish_points += 20
-        reasons.append("MACD momentum is bullish.")
-    else:
-        bearish_points += 20
-        reasons.append("MACD momentum is bearish.")
-
-    # RSI
-    if 52 <= latest["rsi"] <= 70:
-        bullish_points += 20
-        reasons.append("RSI supports buying momentum.")
-    elif 30 <= latest["rsi"] <= 48:
-        bearish_points += 20
-        reasons.append("RSI supports selling momentum.")
-    elif latest["rsi"] > 70:
-        bearish_points += 5
-        reasons.append("RSI is overbought; buying now may be risky.")
-    elif latest["rsi"] < 30:
-        bullish_points += 5
-        reasons.append("RSI is oversold; selling now may be risky.")
-    else:
-        reasons.append("RSI is neutral.")
-
-    # Candle direction
-    if latest["close"] > latest["open"]:
-        bullish_points += 10
-        reasons.append("The latest completed candle is bullish.")
-    elif latest["close"] < latest["open"]:
-        bearish_points += 10
-        reasons.append("The latest completed candle is bearish.")
-
-    # Market structure
-    if (
-        latest["high"] > previous["high"]
-        and latest["low"] > previous["low"]
-    ):
-        bullish_points += 20
-        reasons.append("Price formed a higher high and higher low.")
-    elif (
-        latest["high"] < previous["high"]
-        and latest["low"] < previous["low"]
-    ):
-        bearish_points += 20
-        reasons.append("Price formed a lower high and lower low.")
-    else:
-        reasons.append("Short-term market structure is unclear.")
-
-    strongest_score = max(bullish_points, bearish_points)
-
-    if bullish_points >= 65 and bullish_points >= bearish_points + 20:
-        direction = "BUY"
-        confidence = bullish_points
-    elif bearish_points >= 65 and bearish_points >= bullish_points + 20:
-        direction = "SELL"
-        confidence = bearish_points
-    else:
-        direction = "NO TRADE"
-        confidence = strongest_score
-
-    entry = float(latest["close"])
+    price = float(latest["close"])
     atr = float(latest["atr"])
-    stop_distance = max(atr * 1.5, entry * 0.001)
 
-    if direction == "BUY":
-        stop_loss = entry - stop_distance
-        tp1 = entry + stop_distance
-        tp2 = entry + (stop_distance * 2)
-        tp3 = entry + (stop_distance * 3)
-    elif direction == "SELL":
-        stop_loss = entry + stop_distance
-        tp1 = entry - stop_distance
-        tp2 = entry - (stop_distance * 2)
-        tp3 = entry - (stop_distance * 3)
+    if price > latest["ema_20"]:
+        bullish_points += 15
+        bullish_reasons.append("Price is above the 20 EMA")
     else:
-        stop_loss = np.nan
-        tp1 = np.nan
-        tp2 = np.nan
-        tp3 = np.nan
+        bearish_points += 15
+        bearish_reasons.append("Price is below the 20 EMA")
+
+    if latest["ema_20"] > latest["ema_50"]:
+        bullish_points += 20
+        bullish_reasons.append("20 EMA is above the 50 EMA")
+    else:
+        bearish_points += 20
+        bearish_reasons.append("20 EMA is below the 50 EMA")
+
+    if latest["ema_9"] > latest["ema_20"]:
+        bullish_points += 10
+        bullish_reasons.append("Short-term EMA momentum is bullish")
+    else:
+        bearish_points += 10
+        bearish_reasons.append("Short-term EMA momentum is bearish")
+
+    if latest["macd"] > latest["macd_signal"]:
+        bullish_points += 15
+        bullish_reasons.append("MACD momentum is bullish")
+    else:
+        bearish_points += 15
+        bearish_reasons.append("MACD momentum is bearish")
+
+    if latest["macd_histogram"] > previous["macd_histogram"]:
+        bullish_points += 10
+        bullish_reasons.append("Bullish momentum is increasing")
+    else:
+        bearish_points += 10
+        bearish_reasons.append("Bearish momentum is increasing")
+
+    rsi = float(latest["rsi"])
+
+    if 52 <= rsi <= 70:
+        bullish_points += 15
+        bullish_reasons.append(f"RSI supports buyers at {rsi:.1f}")
+    elif 30 <= rsi <= 48:
+        bearish_points += 15
+        bearish_reasons.append(f"RSI supports sellers at {rsi:.1f}")
+    elif rsi > 70:
+        bearish_points += 5
+        bearish_reasons.append(
+            f"RSI is overbought at {rsi:.1f}"
+        )
+    elif rsi < 30:
+        bullish_points += 5
+        bullish_reasons.append(
+            f"RSI is oversold at {rsi:.1f}"
+        )
+
+    recent_closes = data["close"].tail(6)
+
+    if recent_closes.iloc[-1] > recent_closes.iloc[0]:
+        bullish_points += 15
+        bullish_reasons.append("Recent price structure is rising")
+    else:
+        bearish_points += 15
+        bearish_reasons.append("Recent price structure is falling")
+
+    total_points = bullish_points + bearish_points
+
+    if total_points == 0:
+        total_points = 1
+
+    bullish_percentage = round(
+        bullish_points / total_points * 100
+    )
+
+    bearish_percentage = round(
+        bearish_points / total_points * 100
+    )
+
+    score_difference = abs(
+        bullish_percentage - bearish_percentage
+    )
+
+    if (
+        bullish_percentage >= 62
+        and score_difference >= 20
+    ):
+        signal = "BUY"
+        confidence = bullish_percentage
+        reasons = bullish_reasons
+    elif (
+        bearish_percentage >= 62
+        and score_difference >= 20
+    ):
+        signal = "SELL"
+        confidence = bearish_percentage
+        reasons = bearish_reasons
+    else:
+        signal = "NO TRADE"
+        confidence = max(
+            bullish_percentage,
+            bearish_percentage,
+        )
+        reasons = [
+            "Indicators are conflicting",
+            "There is not enough confirmation for a quality setup",
+        ]
+
+    support, resistance = calculate_support_resistance(data)
+
+    if signal == "BUY":
+        entry = price
+        limit_entry = max(
+            float(latest["ema_20"]),
+            price - (atr * 0.45),
+        )
+        stop_loss = min(
+            support - (atr * 0.15),
+            entry - (atr * 1.35),
+        )
+
+        risk_distance = entry - stop_loss
+
+        tp1 = entry + risk_distance
+        tp2 = entry + (risk_distance * 2)
+        tp3 = entry + (risk_distance * 3)
+
+    elif signal == "SELL":
+        entry = price
+        limit_entry = min(
+            float(latest["ema_20"]),
+            price + (atr * 0.45),
+        )
+        stop_loss = max(
+            resistance + (atr * 0.15),
+            entry + (atr * 1.35),
+        )
+
+        risk_distance = stop_loss - entry
+
+        tp1 = entry - risk_distance
+        tp2 = entry - (risk_distance * 2)
+        tp3 = entry - (risk_distance * 3)
+
+    else:
+        entry = price
+        limit_entry = float(latest["ema_20"])
+        stop_loss = None
+        risk_distance = None
+        tp1 = None
+        tp2 = None
+        tp3 = None
 
     return {
-        "direction": direction,
-        "confidence": min(int(confidence), 100),
+        "signal": signal,
+        "confidence": confidence,
+        "bullish_score": bullish_percentage,
+        "bearish_score": bearish_percentage,
+        "price": price,
         "entry": entry,
+        "limit_entry": limit_entry,
         "stop_loss": stop_loss,
-        "stop_distance": stop_distance,
+        "risk_distance": risk_distance,
         "tp1": tp1,
         "tp2": tp2,
         "tp3": tp3,
-        "rsi": float(latest["rsi"]),
+        "support": support,
+        "resistance": resistance,
+        "rsi": rsi,
         "atr": atr,
-        "ema20": float(latest["ema20"]),
-        "ema50": float(latest["ema50"]),
-        "reasons": reasons,
-        "candle_time": latest["datetime"],
+        "reasons": reasons[:6],
     }
 
 
-def create_risk_table(
-    balance_gbp: float,
-    gbp_usd: float,
-    entry: float,
-    stop_distance: float,
-    leverage: int,
-) -> pd.DataFrame:
-    """Calculate loss, lot size, profit targets and margin."""
-    rows = []
+# =========================================================
+# HISTORICAL REVERSAL ANALYSIS
+# =========================================================
 
-    for risk_percentage in [1, 2, 3, 5, 10]:
-        risk_gbp = balance_gbp * risk_percentage / 100
-        risk_usd = risk_gbp * gbp_usd
+def detect_reversal(data: pd.DataFrame):
+    latest = data.iloc[-1]
+    previous = data.iloc[-2]
 
-        loss_per_one_lot_usd = stop_distance * GOLD_CONTRACT_SIZE
+    price = float(latest["close"])
+    atr = float(latest["atr"])
 
-        if loss_per_one_lot_usd <= 0:
-            lot_size = 0.0
-        else:
-            lot_size = risk_usd / loss_per_one_lot_usd
-
-        # Round down to 0.01 so displayed risk is not exceeded.
-        lot_size = math.floor(lot_size * 100) / 100
-        lot_size = max(lot_size, 0.0)
-
-        actual_loss_usd = (
-            lot_size * GOLD_CONTRACT_SIZE * stop_distance
-        )
-        actual_loss_gbp = actual_loss_usd / gbp_usd
-
-        margin_usd = (
-            entry * GOLD_CONTRACT_SIZE * lot_size / leverage
-        )
-        margin_gbp = margin_usd / gbp_usd
-
-        rows.append(
-            {
-                "Risk": f"{risk_percentage}%",
-                "Maximum loss": f"£{risk_gbp:,.2f}",
-                "Lot size": f"{lot_size:.2f}",
-                "Estimated actual loss": f"£{actual_loss_gbp:,.2f}",
-                "TP1 profit (1:1)": f"£{actual_loss_gbp:,.2f}",
-                "TP2 profit (1:2)": f"£{actual_loss_gbp * 2:,.2f}",
-                "TP3 profit (1:3)": f"£{actual_loss_gbp * 3:,.2f}",
-                "Estimated margin": f"£{margin_gbp:,.2f}",
-            }
-        )
-
-    return pd.DataFrame(rows)
-
-
-def make_chart(data: pd.DataFrame) -> go.Figure:
-    chart_data = data.tail(100)
-
-    figure = go.Figure()
-
-    figure.add_trace(
-        go.Candlestick(
-            x=chart_data["datetime"],
-            open=chart_data["open"],
-            high=chart_data["high"],
-            low=chart_data["low"],
-            close=chart_data["close"],
-            name="XAU/USD",
-        )
+    support, resistance = calculate_support_resistance(
+        data,
+        lookback=80,
     )
 
-    figure.add_trace(
-        go.Scatter(
-            x=chart_data["datetime"],
-            y=chart_data["ema20"],
-            mode="lines",
-            name="EMA 20",
+    bullish_points = 0
+    bearish_points = 0
+
+    bullish_reasons = []
+    bearish_reasons = []
+
+    distance_to_support = abs(price - support)
+    distance_to_resistance = abs(resistance - price)
+
+    if distance_to_support <= atr * 1.5:
+        bullish_points += 25
+        bullish_reasons.append(
+            "Price is close to an historical support zone"
         )
-    )
 
-    figure.add_trace(
-        go.Scatter(
-            x=chart_data["datetime"],
-            y=chart_data["ema50"],
-            mode="lines",
-            name="EMA 50",
+    if distance_to_resistance <= atr * 1.5:
+        bearish_points += 25
+        bearish_reasons.append(
+            "Price is close to an historical resistance zone"
         )
+
+    if latest["rsi"] < 35:
+        bullish_points += 20
+        bullish_reasons.append(
+            f"RSI is oversold at {latest['rsi']:.1f}"
+        )
+
+    if latest["rsi"] > 65:
+        bearish_points += 20
+        bearish_reasons.append(
+            f"RSI is overbought at {latest['rsi']:.1f}"
+        )
+
+    bullish_candle = (
+        latest["close"] > latest["open"]
+        and latest["close"] > previous["high"]
     )
 
-    figure.update_layout(
-        title="XAU/USD 15-minute chart",
-        xaxis_title="Time (UTC)",
-        yaxis_title="Gold price in USD",
-        xaxis_rangeslider_visible=False,
-        height=550,
-        margin=dict(l=10, r=10, t=50, b=10),
+    bearish_candle = (
+        latest["close"] < latest["open"]
+        and latest["close"] < previous["low"]
     )
 
-    return figure
+    if bullish_candle:
+        bullish_points += 25
+        bullish_reasons.append(
+            "Bullish breakout candle has formed"
+        )
+
+    if bearish_candle:
+        bearish_points += 25
+        bearish_reasons.append(
+            "Bearish breakdown candle has formed"
+        )
+
+    recent = data.tail(12)
+
+    price_change = (
+        recent["close"].iloc[-1]
+        - recent["close"].iloc[0]
+    )
+
+    rsi_change = (
+        recent["rsi"].iloc[-1]
+        - recent["rsi"].iloc[0]
+    )
+
+    if price_change < 0 and rsi_change > 4:
+        bullish_points += 30
+        bullish_reasons.append(
+            "Possible bullish RSI divergence detected"
+        )
+
+    if price_change > 0 and rsi_change < -4:
+        bearish_points += 30
+        bearish_reasons.append(
+            "Possible bearish RSI divergence detected"
+        )
+
+    if (
+        latest["macd_histogram"] > previous["macd_histogram"]
+        and latest["macd_histogram"] < 0
+    ):
+        bullish_points += 15
+        bullish_reasons.append(
+            "Selling momentum appears to be weakening"
+        )
+
+    if (
+        latest["macd_histogram"] < previous["macd_histogram"]
+        and latest["macd_histogram"] > 0
+    ):
+        bearish_points += 15
+        bearish_reasons.append(
+            "Buying momentum appears to be weakening"
+        )
+
+    strongest_score = max(
+        bullish_points,
+        bearish_points,
+    )
+
+    confidence = min(strongest_score, 95)
+
+    if bullish_points >= 50 and bullish_points > bearish_points:
+        reversal_type = "Potential bullish reversal"
+        zone_low = support
+        zone_high = support + atr
+        confirmation = price + (atr * 0.35)
+        invalidation = support - (atr * 0.4)
+        reasons = bullish_reasons
+
+    elif bearish_points >= 50 and bearish_points > bullish_points:
+        reversal_type = "Potential bearish reversal"
+        zone_low = resistance - atr
+        zone_high = resistance
+        confirmation = price - (atr * 0.35)
+        invalidation = resistance + (atr * 0.4)
+        reasons = bearish_reasons
+
+    else:
+        reversal_type = "No strong reversal setup detected"
+        zone_low = None
+        zone_high = None
+        confirmation = None
+        invalidation = None
+        reasons = [
+            "Historical price action does not currently show "
+            "enough reversal confirmation"
+        ]
+
+    return {
+        "type": reversal_type,
+        "confidence": confidence,
+        "zone_low": zone_low,
+        "zone_high": zone_high,
+        "confirmation": confirmation,
+        "invalidation": invalidation,
+        "reasons": reasons[:5],
+    }
 
 
-# ---------------------------------------------------------
-# APP
-# ---------------------------------------------------------
+# =========================================================
+# LOT SIZE ESTIMATE
+# =========================================================
 
-api_key = get_api_key()
+def estimate_lot_size(
+    category: str,
+    risk_amount_gbp: float,
+    stop_distance: Optional[float],
+):
+    if not stop_distance or stop_distance <= 0:
+        return None, None
+
+    # These are approximate common contract values.
+    # Broker specifications can differ.
+    if category == "gold":
+        value_per_price_unit_per_lot_gbp = 79.0
+
+    elif category == "forex":
+        value_per_price_unit_per_lot_gbp = 79000.0
+
+    else:
+        value_per_price_unit_per_lot_gbp = 39.5
+
+    loss_per_lot = (
+        stop_distance
+        * value_per_price_unit_per_lot_gbp
+    )
+
+    if loss_per_lot <= 0:
+        return None, None
+
+    raw_lot = risk_amount_gbp / loss_per_lot
+    rounded_lot = math.floor(raw_lot * 100) / 100
+
+    return max(rounded_lot, 0.01), loss_per_lot
+
+
+# =========================================================
+# SIDEBAR
+# =========================================================
 
 with st.sidebar:
-    st.header("Account settings")
+    st.header("Trade settings")
+
+    selected_market = st.selectbox(
+        "Market",
+        list(MARKETS.keys()),
+    )
+
+    selected_interval_name = st.selectbox(
+        "Chart timeframe",
+        list(INTERVALS.keys()),
+        index=1,
+    )
 
     account_balance = st.number_input(
         "Account balance (£)",
-        min_value=10.0,
+        min_value=1.0,
         value=200.0,
         step=10.0,
     )
 
-    leverage = st.selectbox(
-        "Broker leverage",
-        options=[30, 50, 100, 200, 500],
-        index=4,
+    risk_percentage = st.slider(
+        "Risk per trade (%)",
+        min_value=0.5,
+        max_value=10.0,
+        value=2.0,
+        step=0.5,
     )
 
-    st.caption(
-        "Lot-size calculations assume 1.00 Gold lot equals 100 ounces. "
-        "Confirm this in your broker's XAU/USD contract specification."
+    history_size = st.select_slider(
+        "Candle history",
+        options=[100, 150, 200, 300, 500],
+        value=200,
     )
 
-    refresh = st.button(
-        "Refresh analysis",
+    st.warning(
+        "10% risk per trade is extremely high. "
+        "A small losing run can reduce the account quickly."
+    )
+
+    refresh_pressed = st.button(
+        "🔄 Refresh analysis",
         use_container_width=True,
     )
 
-if refresh:
+if refresh_pressed:
     st.cache_data.clear()
 
-try:
-    with st.spinner("Loading live Gold market data..."):
-        gold_data = fetch_market_data(
-            symbol="XAU/USD",
-            interval="15min",
-            outputsize=250,
-            api_key=api_key,
-        )
 
-        gbp_usd_data = fetch_market_data(
-            symbol="GBP/USD",
-            interval="15min",
-            outputsize=60,
-            api_key=api_key,
-        )
+# =========================================================
+# LOAD DATA
+# =========================================================
 
-        gold_data = add_indicators(gold_data)
-        analysis = analyse_setup(gold_data)
+market_settings = MARKETS[selected_market]
+interval = INTERVALS[selected_interval_name]
 
-        gbp_usd = float(gbp_usd_data.iloc[-1]["close"])
+with st.spinner("Loading live market candles..."):
+    candles, working_symbol, data_error = fetch_candles(
+        tuple(market_settings["symbols"]),
+        interval,
+        history_size,
+        API_KEY,
+    )
 
-except RuntimeError as exc:
-    st.error(str(exc))
+if data_error or candles is None:
+    st.error(
+        f"Could not load {selected_market}.\n\n"
+        f"Reason: {data_error}\n\n"
+        "Some S&P futures symbols require a paid market-data "
+        "subscription. Try S&P 500 Index or another market."
+    )
     st.stop()
 
-direction = analysis["direction"]
+data = add_indicators(candles)
 
-if direction == "BUY":
-    st.success(
-        f"Current result: BUY — setup score {analysis['confidence']}/100"
-    )
-elif direction == "SELL":
-    st.error(
-        f"Current result: SELL — setup score {analysis['confidence']}/100"
-    )
-else:
-    st.warning(
-        f"Current result: NO TRADE — strongest score "
-        f"{analysis['confidence']}/100"
-    )
+if len(data) < 30:
+    st.error("Not enough processed candle data to run the analysis.")
+    st.stop()
 
-metric1, metric2, metric3, metric4 = st.columns(4)
+analysis = analyse_market(data)
+reversal = detect_reversal(data)
 
-metric1.metric(
-    "Gold price",
-    f"${analysis['entry']:,.2f}",
+digits = market_settings["digits"]
+
+format_price = lambda value: (
+    "—"
+    if value is None
+    else f"{value:,.{digits}f}"
 )
 
-metric2.metric(
+
+# =========================================================
+# LIVE MARKET HEADER
+# =========================================================
+
+st.subheader(f"{selected_market} · {selected_interval_name}")
+st.caption(f"Data symbol currently working: `{working_symbol}`")
+
+top_col1, top_col2, top_col3, top_col4 = st.columns(4)
+
+top_col1.metric(
+    "Current price",
+    format_price(analysis["price"]),
+)
+
+top_col2.metric(
+    "Signal",
+    analysis["signal"],
+)
+
+top_col3.metric(
+    "Setup confidence",
+    f"{analysis['confidence']}%",
+)
+
+top_col4.metric(
     "RSI",
     f"{analysis['rsi']:.1f}",
 )
 
-metric3.metric(
-    "ATR",
-    f"${analysis['atr']:.2f}",
+
+# =========================================================
+# CHART
+# =========================================================
+
+chart_data = data.tail(120)
+
+figure = go.Figure()
+
+figure.add_trace(
+    go.Candlestick(
+        x=chart_data["datetime"],
+        open=chart_data["open"],
+        high=chart_data["high"],
+        low=chart_data["low"],
+        close=chart_data["close"],
+        name="Price",
+    )
 )
 
-metric4.metric(
-    "GBP/USD",
-    f"{gbp_usd:.5f}",
+figure.add_trace(
+    go.Scatter(
+        x=chart_data["datetime"],
+        y=chart_data["ema_20"],
+        mode="lines",
+        name="EMA 20",
+    )
+)
+
+figure.add_trace(
+    go.Scatter(
+        x=chart_data["datetime"],
+        y=chart_data["ema_50"],
+        mode="lines",
+        name="EMA 50",
+    )
+)
+
+figure.add_hline(
+    y=analysis["support"],
+    line_dash="dot",
+    annotation_text="Support",
+)
+
+figure.add_hline(
+    y=analysis["resistance"],
+    line_dash="dot",
+    annotation_text="Resistance",
+)
+
+figure.update_layout(
+    height=570,
+    xaxis_rangeslider_visible=False,
+    margin=dict(l=10, r=10, t=25, b=10),
+    legend=dict(orientation="h"),
 )
 
 st.plotly_chart(
-    make_chart(gold_data),
+    figure,
     use_container_width=True,
 )
 
-st.subheader("Setup checklist")
+
+# =========================================================
+# TRADE PLAN
+# =========================================================
+
+st.subheader("🎯 Trade setup")
+
+if analysis["signal"] == "NO TRADE":
+    st.warning(
+        "NO TRADE — the indicators do not currently provide "
+        "enough confirmation."
+    )
+
+else:
+    signal_col1, signal_col2, signal_col3 = st.columns(3)
+
+    signal_col1.metric(
+        "Suggested market entry",
+        format_price(analysis["entry"]),
+    )
+
+    signal_col2.metric(
+        f"{analysis['signal'].title()} limit",
+        format_price(analysis["limit_entry"]),
+    )
+
+    signal_col3.metric(
+        "Stop loss",
+        format_price(analysis["stop_loss"]),
+    )
+
+    tp_col1, tp_col2, tp_col3 = st.columns(3)
+
+    tp_col1.metric(
+        "TP1 · 1:1",
+        format_price(analysis["tp1"]),
+    )
+
+    tp_col2.metric(
+        "TP2 · 1:2",
+        format_price(analysis["tp2"]),
+    )
+
+    tp_col3.metric(
+        "TP3 · 1:3",
+        format_price(analysis["tp3"]),
+    )
+
+
+# =========================================================
+# RISK AND LOT SIZE
+# =========================================================
+
+st.subheader("💷 Risk and position size")
+
+risk_amount = account_balance * (
+    risk_percentage / 100
+)
+
+estimated_lot, loss_per_lot = estimate_lot_size(
+    market_settings["category"],
+    risk_amount,
+    analysis["risk_distance"],
+)
+
+risk_col1, risk_col2, risk_col3 = st.columns(3)
+
+risk_col1.metric(
+    "Account risk",
+    f"£{risk_amount:,.2f}",
+)
+
+risk_col2.metric(
+    "Stop distance",
+    format_price(analysis["risk_distance"]),
+)
+
+risk_col3.metric(
+    "Estimated maximum lot",
+    "—" if estimated_lot is None else f"{estimated_lot:.2f}",
+)
+
+st.info(
+    "Lot size is an estimate because contract sizes, tick values, "
+    "currency conversion and symbol specifications vary by broker. "
+    "Check the exact loss shown in MT5 before placing the trade."
+)
+
+
+# =========================================================
+# SUPPORT, RESISTANCE AND SCORES
+# =========================================================
+
+st.subheader("📊 Market structure")
+
+structure_col1, structure_col2 = st.columns(2)
+
+structure_col1.metric(
+    "Historical support",
+    format_price(analysis["support"]),
+)
+
+structure_col2.metric(
+    "Historical resistance",
+    format_price(analysis["resistance"]),
+)
+
+score_col1, score_col2 = st.columns(2)
+
+score_col1.metric(
+    "Bullish evidence",
+    f"{analysis['bullish_score']}%",
+)
+
+score_col2.metric(
+    "Bearish evidence",
+    f"{analysis['bearish_score']}%",
+)
+
+st.markdown("#### Why this signal?")
 
 for reason in analysis["reasons"]:
     st.write(f"• {reason}")
 
-if direction != "NO TRADE":
-    st.subheader("Trade plan")
 
-    plan1, plan2, plan3 = st.columns(3)
+# =========================================================
+# REVERSAL EXTRA
+# =========================================================
 
-    plan1.metric("Entry", f"{analysis['entry']:,.2f}")
-    plan1.metric("Stop loss", f"{analysis['stop_loss']:,.2f}")
+st.subheader("🔄 Potential reversal analysis")
+st.caption(
+    "This is an additional historical-chart assessment. "
+    "It does not replace the main setup."
+)
 
-    plan2.metric("TP1 — 1:1", f"{analysis['tp1']:,.2f}")
-    plan2.metric("TP2 — 1:2", f"{analysis['tp2']:,.2f}")
+st.markdown(f"### {reversal['type']}")
 
-    plan3.metric("TP3 — 1:3", f"{analysis['tp3']:,.2f}")
-    plan3.metric(
-        "Stop distance",
-        f"${analysis['stop_distance']:.2f}",
-    )
-
-    st.subheader("Risk and lot-size calculator")
-
-    risk_table = create_risk_table(
-        balance_gbp=account_balance,
-        gbp_usd=gbp_usd,
-        entry=analysis["entry"],
-        stop_distance=analysis["stop_distance"],
-        leverage=leverage,
-    )
-
-    st.dataframe(
-        risk_table,
-        hide_index=True,
-        use_container_width=True,
-    )
-
-    st.warning(
-        "A 10% risk level is extremely aggressive. A short run of losses "
-        "could reduce a small account rapidly. The table shows options, "
-        "not a recommendation to use the largest one."
-    )
+if reversal["type"] == "No strong reversal setup detected":
+    st.info(reversal["reasons"][0])
 
 else:
-    st.info(
-        "No stop loss, take profit or lot size is being suggested because "
-        "the setup has not passed the minimum signal score."
+    reversal_col1, reversal_col2 = st.columns(2)
+
+    reversal_col1.metric(
+        "Historical pattern score",
+        f"{reversal['confidence']}%",
     )
 
-updated_time = datetime.now(timezone.utc)
+    reversal_col2.metric(
+        "Potential zone",
+        (
+            f"{format_price(reversal['zone_low'])} – "
+            f"{format_price(reversal['zone_high'])}"
+        ),
+    )
 
-st.caption(
-    f"Page checked at {updated_time:%d %b %Y, %H:%M:%S} UTC. "
-    "Twelve Data candles may be delayed depending on your subscription."
-)
+    confirmation_col1, confirmation_col2 = st.columns(2)
+
+    confirmation_col1.metric(
+        "Confirmation level",
+        format_price(reversal["confirmation"]),
+    )
+
+    confirmation_col2.metric(
+        "Invalidation level",
+        format_price(reversal["invalidation"]),
+    )
+
+    st.markdown("#### Historical evidence")
+
+    for reason in reversal["reasons"]:
+        st.write(f"• {reason}")
+
+
+# =========================================================
+# FOOTER
+# =========================================================
 
 st.divider()
 
 st.caption(
-    "Important: This tool cannot predict the market or guarantee profit. "
-    "Prices and contract specifications can differ between Twelve Data "
-    "and your broker. Always verify the entry price, contract size, "
-    "minimum lot, spread and stop-loss amount in your broker platform."
+    "Educational trading research only. Prices may be delayed. "
+    "Always confirm the live broker price, spread, contract size, "
+    "stop-loss cost and upcoming economic news before trading."
 )
